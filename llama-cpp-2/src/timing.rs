@@ -77,6 +77,12 @@ impl LlamaTimings {
         self.timings.n_eval
     }
 
+    /// Get the number of prompt tokens reused from existing context state.
+    #[must_use]
+    pub fn n_reused(&self) -> i32 {
+        self.timings.n_reused
+    }
+
     /// Set the start time in milliseconds.
     pub fn set_t_start_ms(&mut self, t_start_ms: f64) {
         self.timings.t_start_ms = t_start_ms;
@@ -105,6 +111,11 @@ impl LlamaTimings {
     /// Set the number of evaluations.
     pub fn set_n_eval(&mut self, n_eval: i32) {
         self.timings.n_eval = n_eval;
+    }
+
+    /// Set the number of reused prompt tokens.
+    pub fn set_n_reused(&mut self, n_reused: i32) {
+        self.timings.n_reused = n_reused;
     }
 }
 

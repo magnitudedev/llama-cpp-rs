@@ -1,8 +1,19 @@
 use super::LogOptions;
-use std::sync::OnceLock;
+use std::sync::{Mutex, MutexGuard, OnceLock};
 use tracing_core::{callsite, field, identify_callsite, Interest, Kind, Metadata};
 
 static FIELD_NAMES: &[&str] = &["message", "module"];
+
+// Serialize logger mutations made through this module. Upstream common/fit independently replaces
+// the same process-global callback with call-local state, so callers must not run fit concurrently
+// with other native work that can log.
+static NATIVE_LOGGER_MUTATION: Mutex<()> = Mutex::new(());
+
+pub(crate) fn lock_native_logger() -> MutexGuard<'static, ()> {
+    NATIVE_LOGGER_MUTATION
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 struct OverridableFields {
     message: tracing::field::Field,
@@ -70,14 +81,14 @@ log_cs!(
 
 #[derive(Clone, Copy)]
 pub(super) enum Module {
-    GGML,
+    Ggml,
     LlamaCpp,
 }
 
 impl Module {
-    const fn name(&self) -> &'static str {
+    const fn name(self) -> &'static str {
         match self {
-            Module::GGML => "ggml",
+            Module::Ggml => "ggml",
             Module::LlamaCpp => "llama.cpp",
         }
     }
@@ -101,7 +112,7 @@ pub(super) struct State {
     pub(super) options: LogOptions,
     module: Module,
     buffered: std::sync::Mutex<Option<(llama_cpp_sys_2::ggml_log_level, String)>>,
-    previous_level: std::sync::atomic::AtomicI32,
+    previous_level: std::sync::atomic::AtomicU32,
     is_buffering: std::sync::atomic::AtomicBool,
 }
 
@@ -110,9 +121,9 @@ impl State {
         Self {
             options,
             module,
-            buffered: Default::default(),
-            previous_level: Default::default(),
-            is_buffering: Default::default(),
+            buffered: std::sync::Mutex::default(),
+            previous_level: std::sync::atomic::AtomicU32::default(),
+            is_buffering: std::sync::atomic::AtomicBool::default(),
         }
     }
 
@@ -171,8 +182,7 @@ impl State {
         } else {
             let level = self
                 .previous_level
-                .load(std::sync::atomic::Ordering::Acquire)
-                as llama_cpp_sys_2::ggml_log_level;
+                .load(std::sync::atomic::Ordering::Acquire);
             tracing::warn!(
                 inferred_level = level,
                 text = text,
@@ -200,13 +210,13 @@ impl State {
                 origin = "crate",
                 "Message buffered unnnecessarily due to missing newline and not followed by a CONT"
             );
-            Self::generate_log(self.module, previous_log_level, buffer.as_str())
+            Self::generate_log(self.module, previous_log_level, buffer.as_str());
         }
 
         self.is_buffering
             .store(true, std::sync::atomic::Ordering::Release);
         self.previous_level
-            .store(level as i32, std::sync::atomic::Ordering::Release);
+            .store(level, std::sync::atomic::Ordering::Release);
     }
 
     // Emit a normal unbuffered log message (not the CONT log level and the text ends with a newline).
@@ -226,7 +236,7 @@ impl State {
         }
 
         self.previous_level
-            .store(level as i32, std::sync::atomic::Ordering::Release);
+            .store(level, std::sync::atomic::Ordering::Release);
 
         let (text, newline) = text.split_at(text.len() - 1);
         debug_assert_eq!(newline, "\n");
@@ -247,7 +257,7 @@ impl State {
                     text = text,
                     origin = "crate",
                     "Unknown llama.cpp log level"
-                )
+                );
             }
         }
     }
@@ -258,7 +268,7 @@ impl State {
     ) {
         if level != llama_cpp_sys_2::GGML_LOG_LEVEL_CONT {
             self.previous_level
-                .store(level as i32, std::sync::atomic::Ordering::Release);
+                .store(level, std::sync::atomic::Ordering::Release);
         }
     }
 
@@ -268,7 +278,6 @@ impl State {
         let level = if level == llama_cpp_sys_2::GGML_LOG_LEVEL_CONT {
             self.previous_level
                 .load(std::sync::atomic::Ordering::Relaxed)
-                as llama_cpp_sys_2::ggml_log_level
         } else {
             level
         };
@@ -336,7 +345,8 @@ mod tests {
     fn cont_disabled_log() {
         let logger = create_logger(tracing::Level::INFO);
         let mut log_state = Box::new(State::new(Module::LlamaCpp, LogOptions::default()));
-        let log_ptr = log_state.as_mut() as *mut State as *mut std::os::raw::c_void;
+        let log_ptr =
+            std::ptr::from_mut::<State>(log_state.as_mut()).cast::<std::os::raw::c_void>();
 
         logs_to_trace(
             llama_cpp_sys_2::GGML_LOG_LEVEL_DEBUG,
@@ -372,7 +382,8 @@ mod tests {
     fn cont_enabled_log() {
         let logger = create_logger(tracing::Level::INFO);
         let mut log_state = Box::new(State::new(Module::LlamaCpp, LogOptions::default()));
-        let log_ptr = log_state.as_mut() as *mut State as *mut std::os::raw::c_void;
+        let log_ptr =
+            std::ptr::from_mut::<State>(log_state.as_mut()).cast::<std::os::raw::c_void>();
 
         logs_to_trace(
             llama_cpp_sys_2::GGML_LOG_LEVEL_INFO,

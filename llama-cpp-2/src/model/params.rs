@@ -1,5 +1,6 @@
 //! A safe wrapper around `llama_model_params`.
 
+#[cfg(feature = "common")]
 use crate::context::params::LlamaContextParams;
 use crate::model::params::kv_overrides::KvOverrides;
 use crate::LlamaCppError;
@@ -8,6 +9,8 @@ use std::fmt::{Debug, Formatter};
 use std::pin::Pin;
 use std::ptr::null;
 
+#[cfg(feature = "common")]
+pub mod fit;
 pub mod kv_overrides;
 
 /// Result of [`LlamaModelParams::fit_params`], containing the fitted context size.
@@ -22,6 +25,14 @@ pub struct FitResult {
 #[cfg(feature = "common")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum FitError {
+    /// The margin vector is shorter than `llama_max_devices()`.
+    #[error("fit margins contain {provided} entries but at least {required} are required")]
+    InvalidMargins {
+        /// Entries supplied by the caller.
+        provided: usize,
+        /// Entries required by the native build.
+        required: usize,
+    },
     /// Could not find allocations that are projected to fit available memory.
     #[error("could not find allocations that fit available memory")]
     Failure,
@@ -55,6 +66,42 @@ pub enum LlamaSplitMode {
     Row = LLAMA_SPLIT_MODE_ROW,
     /// Experimental tensor parallelism across GPUs
     Tensor = LLAMA_SPLIT_MODE_TENSOR,
+}
+
+/// Typed GPU-layer selection understood by llama.cpp model loading.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum LlamaGpuLayers {
+    /// Preserve llama.cpp's native `-1` setting.
+    ///
+    /// Callers seeking `llama-server` auto-placement must run `common/fit` before loading; bare
+    /// libllama interprets this value as offloading all available layers.
+    Auto,
+    /// Offload every supported layer (`-2`).
+    All,
+    /// Offload an explicit number of layers.
+    Count(u32),
+}
+
+impl LlamaGpuLayers {
+    /// Decode llama.cpp's signed sentinel representation.
+    #[must_use]
+    pub fn from_raw(value: i32) -> Self {
+        match value {
+            -1 => Self::Auto,
+            value if value < -1 => Self::All,
+            value => Self::Count(value.cast_unsigned()),
+        }
+    }
+
+    /// Encode this selection using llama.cpp's signed sentinel representation.
+    #[must_use]
+    pub fn as_raw(self) -> i32 {
+        match self {
+            Self::Auto => -1,
+            Self::All => -2,
+            Self::Count(value) => i32::try_from(value).unwrap_or(i32::MAX),
+        }
+    }
 }
 
 /// An error that occurs when unknown split mode is encountered.
@@ -142,6 +189,30 @@ impl Default for LlamaSplitMode {
 /// `llama_cpp_2::max_devices()`.
 pub const LLAMA_CPP_MAX_DEVICES: usize = 16;
 
+/// Invalid per-device model tensor split weights.
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+pub enum TensorSplitError {
+    /// More entries were supplied than llama.cpp can consume.
+    #[error("tensor split has {provided} entries but llama.cpp supports at most {maximum}")]
+    TooMany {
+        /// Number of supplied weights.
+        provided: usize,
+        /// Maximum native device count.
+        maximum: usize,
+    },
+    /// A weight was negative or non-finite.
+    #[error("tensor split weight {index} must be finite and non-negative, received {value}")]
+    InvalidWeight {
+        /// Index of the invalid weight.
+        index: usize,
+        /// Invalid value.
+        value: f32,
+    },
+    /// An explicit split must assign a non-zero proportion to a device.
+    #[error("tensor split must contain at least one positive weight")]
+    AllZero,
+}
+
 /// A safe wrapper around `llama_model_params`.
 #[allow(clippy::module_name_repetitions)]
 pub struct LlamaModelParams {
@@ -153,6 +224,7 @@ pub struct LlamaModelParams {
     progress_callback: Option<Box<dyn FnMut(f32) -> bool>>,
 }
 
+#[allow(clippy::missing_fields_in_debug)] // Callback closures and pointer backing stores are opaque.
 impl Debug for LlamaModelParams {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LlamaModelParams")
@@ -181,7 +253,7 @@ impl LlamaModelParams {
     /// assert_eq!(count, 0);
     /// ```
     #[must_use]
-    pub fn kv_overrides<'a>(&'a self) -> KvOverrides<'a> {
+    pub fn kv_overrides(&self) -> KvOverrides<'_> {
         KvOverrides::new(self)
     }
 
@@ -255,6 +327,11 @@ impl LlamaModelParams {
 
     /// Appends a buffer type override to the model parameters, to move layers matching pattern to CPU.
     /// It must be pinned as this creates a self-referential struct.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the sentinel entry is missing, the pattern is not representable as native chars,
+    /// or the previous sentinel has already been populated unexpectedly.
     pub fn add_cpu_buft_override(mut self: Pin<&mut Self>, key: &CStr) {
         let buft_override = self
             .buft_overrides
@@ -267,7 +344,7 @@ impl LlamaModelParams {
         );
 
         // There should be some way to do this without iterating over everything.
-        for &c in key.to_bytes_with_nul().iter() {
+        for &c in key.to_bytes_with_nul() {
             c_char::try_from(c).expect("invalid character in key");
         }
 
@@ -315,13 +392,14 @@ impl LlamaModelParams {
     /// - `margins` — memory margin per device in bytes. Must have at least
     ///   `llama_max_devices()` elements.
     /// - `n_ctx_min` — minimum context size to preserve when reducing memory usage.
-    /// - `log_level` — minimum log level for fitting output; lower levels are routed
-    ///   to the debug log.
+    /// - `log_level` — minimum log level for fitting output; lower levels are routed to the debug
+    ///   log.
     ///
-    /// # Thread safety
+    /// # Concurrency
     ///
-    /// This function is **not** thread safe: the underlying C call mutates the global
-    /// llama logger state.
+    /// The upstream fit implementation temporarily replaces llama.cpp's process-global logger
+    /// with a callback backed by call-local state. Concurrent fit calls are therefore unsupported.
+    /// This binding intentionally uses the pinned upstream implementation unchanged.
     ///
     /// # Errors
     ///
@@ -336,6 +414,12 @@ impl LlamaModelParams {
         log_level: llama_cpp_sys_2::ggml_log_level,
     ) -> Result<FitResult, FitError> {
         let max_devices = unsafe { llama_cpp_sys_2::llama_max_devices() };
+        if margins.len() < max_devices {
+            return Err(FitError::InvalidMargins {
+                provided: margins.len(),
+                required: max_devices,
+            });
+        }
         let max_buft = unsafe { llama_cpp_sys_2::llama_max_tensor_buft_overrides() };
 
         // Allocate tensor_split output buffer.
@@ -369,16 +453,18 @@ impl LlamaModelParams {
             )
         };
 
+        // The native fit path may point the raw params at these buffers even
+        // when it reports failure, so restore their stable owned addresses
+        // before any early return.
+        self.params.tensor_split = self.tensor_split.as_ptr();
+        self.params.tensor_buft_overrides = self.buft_overrides.as_ptr();
+
         // llama_rs_fit_params returns common_params_fit_status: 0 = success, 1 = failure, 2 = error.
         match status {
             0 => {}
             1 => return Err(FitError::Failure),
             _ => return Err(FitError::Error),
         }
-
-        // Wire the owned buffers into the raw params.
-        self.params.tensor_split = self.tensor_split.as_ptr();
-        self.params.tensor_buft_overrides = self.buft_overrides.as_ptr();
 
         Ok(FitResult {
             n_ctx: cparams.context_params.n_ctx,
@@ -391,6 +477,12 @@ impl LlamaModelParams {
     #[must_use]
     pub fn n_gpu_layers(&self) -> i32 {
         self.params.n_gpu_layers
+    }
+
+    /// Return the typed native GPU-layer setting.
+    #[must_use]
+    pub fn gpu_layers(&self) -> LlamaGpuLayers {
+        LlamaGpuLayers::from_raw(self.params.n_gpu_layers)
     }
 
     /// The GPU that is used for scratch and small tensors
@@ -465,6 +557,13 @@ impl LlamaModelParams {
         self
     }
 
+    /// Set auto, all, or an explicit GPU-layer count without exposing native sentinels.
+    #[must_use]
+    pub fn with_gpu_layers(mut self, gpu_layers: LlamaGpuLayers) -> Self {
+        self.params.n_gpu_layers = gpu_layers.as_raw();
+        self
+    }
+
     /// sets the main GPU
     ///
     /// To enable this option, you must set `split_mode` to `LlamaSplitMode::None` to enable single GPU mode.
@@ -500,6 +599,52 @@ impl LlamaModelParams {
     pub fn with_split_mode(mut self, split_mode: LlamaSplitMode) -> Self {
         self.params.split_mode = split_mode.into();
         self
+    }
+
+    /// Set model-offload proportions for accelerator devices.
+    ///
+    /// The owned buffer is padded to llama.cpp's full device count because the
+    /// native parameter does not carry an independent slice length. Passing an
+    /// empty slice clears an earlier explicit split and restores native
+    /// automatic placement.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TensorSplitError`] for too many, negative, non-finite, or
+    /// entirely zero explicit weights.
+    pub fn with_tensor_split(mut self, weights: &[f32]) -> Result<Self, TensorSplitError> {
+        let maximum = crate::max_devices().min(LLAMA_CPP_MAX_DEVICES);
+        if weights.len() > maximum {
+            return Err(TensorSplitError::TooMany {
+                provided: weights.len(),
+                maximum,
+            });
+        }
+        for (index, value) in weights.iter().copied().enumerate() {
+            if !value.is_finite() || value < 0.0 {
+                return Err(TensorSplitError::InvalidWeight { index, value });
+            }
+        }
+        if !weights.is_empty() && !weights.iter().any(|value| *value > 0.0) {
+            return Err(TensorSplitError::AllZero);
+        }
+
+        self.tensor_split.clear();
+        if weights.is_empty() {
+            self.params.tensor_split = null();
+        } else {
+            self.tensor_split.resize(maximum, 0.0);
+            self.tensor_split[..weights.len()].copy_from_slice(weights);
+            self.params.tensor_split = self.tensor_split.as_ptr();
+        }
+        Ok(self)
+    }
+
+    /// Return the owned full-width native tensor split, or an empty slice when
+    /// automatic placement is active.
+    #[must_use]
+    pub fn tensor_split(&self) -> &[f32] {
+        &self.tensor_split
     }
 
     /// sets `devices`
@@ -567,11 +712,13 @@ impl LlamaModelParams {
             user_data: *mut c_void,
         ) -> bool {
             let callback = unsafe { &mut *user_data.cast::<F>() };
-            callback(progress)
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| callback(progress)))
+                .unwrap_or(false)
         }
 
         let mut callback = Box::new(callback);
-        self.params.progress_callback_user_data = std::ptr::from_mut(&mut *callback).cast::<c_void>();
+        self.params.progress_callback_user_data =
+            std::ptr::from_mut(&mut *callback).cast::<c_void>();
         self.params.progress_callback = Some(trampoline::<F>);
         self.progress_callback = Some(callback);
         self
@@ -618,27 +765,36 @@ impl Default for LlamaModelParams {
 
 #[cfg(test)]
 mod tests {
-    use super::LlamaSplitMode;
+    use super::{LlamaModelParams, TensorSplitError};
 
     #[test]
-    fn tensor_split_mode_round_trips() {
-        assert_eq!(
-            LlamaSplitMode::try_from(llama_cpp_sys_2::LLAMA_SPLIT_MODE_TENSOR),
-            Ok(LlamaSplitMode::Tensor)
-        );
-        assert_eq!(
-            u32::from(LlamaSplitMode::Tensor),
-            llama_cpp_sys_2::LLAMA_SPLIT_MODE_TENSOR as u32
-        );
-        assert_eq!(
-            i32::from(LlamaSplitMode::Tensor),
-            llama_cpp_sys_2::LLAMA_SPLIT_MODE_TENSOR as i32
-        );
+    fn tensor_split_owns_and_pads_native_weights() {
+        let params = LlamaModelParams::default()
+            .with_tensor_split(&[3.0, 1.0])
+            .expect("valid split");
+        assert_eq!(&params.tensor_split()[..2], &[3.0, 1.0]);
+        assert!(params.tensor_split()[2..].iter().all(|value| *value == 0.0));
+        assert_eq!(params.params.tensor_split, params.tensor_split().as_ptr());
+
+        let params = params.with_tensor_split(&[]).expect("clear split");
+        assert!(params.tensor_split().is_empty());
+        assert!(params.params.tensor_split.is_null());
+    }
+
+    #[test]
+    fn tensor_split_rejects_invalid_weights() {
+        assert!(matches!(
+            LlamaModelParams::default().with_tensor_split(&[0.0, 0.0]),
+            Err(TensorSplitError::AllZero)
+        ));
+        assert!(matches!(
+            LlamaModelParams::default().with_tensor_split(&[f32::NAN]),
+            Err(TensorSplitError::InvalidWeight { index: 0, .. })
+        ));
     }
 
     #[test]
     fn progress_callback_round_trips_and_can_abort() {
-        use super::LlamaModelParams;
         use std::cell::Cell;
         use std::rc::Rc;
 
@@ -659,5 +815,17 @@ mod tests {
 
         assert!(!first && !second, "returning false signals an abort");
         assert_eq!(calls.get(), 2);
+    }
+
+    #[test]
+    fn progress_callback_contains_panics_at_the_ffi_boundary() {
+        let params = LlamaModelParams::default().with_progress_callback(|_progress| {
+            panic!("callback panic must not cross the native boundary");
+        });
+
+        let trampoline = params.params.progress_callback.unwrap();
+        let user_data = params.params.progress_callback_user_data;
+
+        assert!(!unsafe { trampoline(0.5, user_data) });
     }
 }

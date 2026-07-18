@@ -8,6 +8,7 @@ use std::path::Path;
 use clap::Parser;
 use encoding_rs::UTF_8;
 
+use llama_cpp_2::context::params::FlashAttentionPolicy;
 use llama_cpp_2::context::params::LlamaContextParams;
 use llama_cpp_2::context::LlamaContext;
 use llama_cpp_2::llama_batch::LlamaBatch;
@@ -17,7 +18,7 @@ use llama_cpp_2::mtmd::{
 };
 
 use llama_cpp_2::llama_backend::LlamaBackend;
-use llama_cpp_2::model::{LlamaChatMessage, LlamaChatTemplate, LlamaModel, Special};
+use llama_cpp_2::model::{LlamaChatMessage, LlamaChatTemplate, LlamaModel};
 use llama_cpp_2::sampling::LlamaSampler;
 
 /// Command line parameters for the MTMD CLI application
@@ -69,19 +70,19 @@ pub struct MtmdCliParams {
     /// Media marker. If not provided, the default marker will be used.
     #[arg(long = "marker", value_name = "TEXT")]
     pub media_marker: Option<String>,
-    /// Minimum number of tokens used to represent an image (-1 for model default).
-    #[arg(long = "image-min-tokens", value_name = "N", default_value = "-1")]
-    pub image_min_tokens: i32,
-    /// Maximum number of tokens used to represent an image (-1 for model default).
-    #[arg(long = "image-max-tokens", value_name = "N", default_value = "-1")]
-    pub image_max_tokens: i32,
+    /// Minimum number of tokens used to represent an image (model default when omitted).
+    #[arg(long = "image-min-tokens", value_name = "N")]
+    pub image_min_tokens: Option<NonZeroU32>,
+    /// Maximum number of tokens used to represent an image (model default when omitted).
+    #[arg(long = "image-max-tokens", value_name = "N")]
+    pub image_max_tokens: Option<NonZeroU32>,
 }
 
 /// State of the MTMD CLI application.
 #[allow(missing_debug_implementations)]
 pub struct MtmdCliContext<'a> {
     /// The MTMD context for multimodal processing.
-    pub mtmd_ctx: MtmdContext,
+    pub mtmd_ctx: MtmdContext<'a>,
     /// The batch used for processing tokens.
     pub batch: LlamaBatch<'a>,
     /// The list of loaded bitmaps (images/audio).
@@ -100,7 +101,7 @@ impl<'a> MtmdCliContext<'a> {
     /// # Errors
     pub fn new(
         params: &MtmdCliParams,
-        model: &LlamaModel,
+        model: &'a LlamaModel,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         // Initialize MTMD context
         let mtmd_params = MtmdContextParams {
@@ -114,6 +115,8 @@ impl<'a> MtmdCliContext<'a> {
                     .unwrap_or(&llama_cpp_2::mtmd::mtmd_default_marker().to_string())
                     .clone(),
             )?,
+            flash_attention: FlashAttentionPolicy::Auto,
+            warmup: true,
             image_min_tokens: params.image_min_tokens,
             image_max_tokens: params.image_max_tokens,
         };
@@ -181,7 +184,7 @@ impl<'a> MtmdCliContext<'a> {
         // Clear bitmaps after tokenization
         self.bitmaps.clear();
 
-        self.n_past = chunks.eval_chunks(&self.mtmd_ctx, context, 0, 0, batch_size, true)?;
+        self.n_past = chunks.eval_chunks(&mut self.mtmd_ctx, context, 0, 0, batch_size, true)?;
         Ok(())
     }
 

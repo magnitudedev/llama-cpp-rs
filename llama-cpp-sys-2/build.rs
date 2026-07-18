@@ -346,9 +346,9 @@ fn main() {
         .allowlist_type("llama_.*")
         .prepend_enum_name(false);
 
-    // The `llama_rs_*` symbols are emitted by `wrapper_common.cpp`, which is
-    // only compiled (and only has its header included from `wrapper.h`) when
-    // the `common` feature is enabled.
+    // The common `llama_rs_*` symbols are emitted by the subsystem bridge
+    // translation units, which are only compiled (and only have their umbrella
+    // header included from `wrapper.h`) when the `common` feature is enabled.
     if cfg!(feature = "common") {
         bindings_builder = bindings_builder
             .clang_arg("-DLLAMA_RS_BUILD_COMMON")
@@ -359,9 +359,15 @@ fn main() {
     // Configure mtmd feature if enabled
     if cfg!(feature = "mtmd") {
         bindings_builder = bindings_builder
+            .clang_arg("-DLLAMA_RS_BUILD_MTMD_EXT")
             .header("wrapper_mtmd.h")
             .allowlist_function("mtmd_.*")
-            .allowlist_type("mtmd_.*");
+            .allowlist_type("mtmd_.*")
+            .allowlist_function("llama_rs_mtmd_.*")
+            .allowlist_function("llama_rs_string_free")
+            .allowlist_type("llama_rs_mtmd_.*")
+            .allowlist_type("llama_rs_bytes_view")
+            .allowlist_type("llama_rs_status");
     }
 
     // Configure Android-specific bindgen settings
@@ -562,17 +568,54 @@ fn main() {
 
     println!("cargo:rerun-if-changed=wrapper.h");
     println!("cargo:rerun-if-changed=wrapper_common.h");
-    println!("cargo:rerun-if-changed=wrapper_common.cpp");
+    for common_wrapper in [
+        "wrapper_common_chat.h",
+        "wrapper_common_chat.cpp",
+        "wrapper_common_sampling.h",
+        "wrapper_common_sampling.cpp",
+        "wrapper_common_fit.h",
+        "wrapper_common_fit.cpp",
+        "wrapper_common_misc.h",
+        "wrapper_common_misc.cpp",
+    ] {
+        println!("cargo:rerun-if-changed={common_wrapper}");
+    }
     println!("cargo:rerun-if-changed=wrapper_utils.h");
+    println!("cargo:rerun-if-changed=wrapper_utils.cpp");
     println!("cargo:rerun-if-changed=wrapper_mtmd.h");
+    println!("cargo:rerun-if-changed=wrapper_mtmd_ext.h");
+    println!("cargo:rerun-if-changed=wrapper_mtmd_ext.cpp");
 
     debug_log!("Bindings Created");
+
+    if cfg!(feature = "common") || cfg!(feature = "mtmd") {
+        let mut utility_wrapper_build = cc::Build::new();
+        utility_wrapper_build
+            .cpp(true)
+            .file("wrapper_utils.cpp")
+            .flag_if_supported("-std=c++17")
+            .pic(true);
+
+        if matches!(target_os, TargetOs::Windows(WindowsVariant::Msvc)) {
+            utility_wrapper_build.flag("/std:c++17");
+        }
+        if matches!(target_os, TargetOs::Android) && cfg!(feature = "static-stdcxx") {
+            utility_wrapper_build.cpp_link_stdlib(None);
+        }
+
+        utility_wrapper_build.compile("llama_cpp_sys_2_wrapper_utils");
+    }
 
     if cfg!(feature = "common") {
         let mut common_wrapper_build = cc::Build::new();
         common_wrapper_build
             .cpp(true)
-            .file("wrapper_common.cpp")
+            .files([
+                "wrapper_common_chat.cpp",
+                "wrapper_common_sampling.cpp",
+                "wrapper_common_fit.cpp",
+                "wrapper_common_misc.cpp",
+            ])
             .include(&llama_src)
             .include(llama_src.join("common"))
             .include(llama_src.join("include"))
@@ -624,7 +667,6 @@ fn main() {
             config.define(&key, &value);
         }
     }
-
     // extract the target-cpu config value, if specified
     let target_cpu = std::env::var("CARGO_ENCODED_RUSTFLAGS")
         .ok()
@@ -993,12 +1035,14 @@ fn main() {
         let mut mtmd_build = cc::Build::new();
         mtmd_build
             .cpp(true)
+            .file("wrapper_mtmd_ext.cpp")
             .include(&mtmd_src)
             .include(&llama_src)
             .include(llama_src.join("include"))
             .include(llama_src.join("ggml/include"))
             .include(llama_src.join("common"))
             .include(llama_src.join("vendor"))
+            .define("LLAMA_RS_BUILD_MTMD_EXT", None)
             .flag_if_supported("-std=c++17")
             .flag_if_supported("-Wno-cast-qual")
             .pic(true);

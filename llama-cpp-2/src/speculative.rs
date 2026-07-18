@@ -139,7 +139,7 @@ impl<'model> MtpSpeculative<'model> {
         let status = unsafe {
             llama_cpp_sys_2::llama_rs_mtp_speculative_process(
                 self.raw.as_ptr(),
-                std::ptr::from_ref(&batch.llama_batch),
+                std::ptr::from_ref(&batch.raw),
             )
         };
         status_to_result(status)
@@ -213,6 +213,6 @@ fn status_to_result(status: llama_cpp_sys_2::llama_rs_status) -> Result<(), MtpS
     if status_is_ok(status) {
         Ok(())
     } else {
-        Err(MtpSpeculativeError::Status(status as i32))
+        Err(MtpSpeculativeError::Status(status))
     }
 }

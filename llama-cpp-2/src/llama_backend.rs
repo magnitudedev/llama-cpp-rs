@@ -2,6 +2,9 @@
 
 use crate::LlamaCppError;
 use llama_cpp_sys_2::ggml_log_level;
+use std::marker::PhantomData;
+use std::num::NonZeroI32;
+use std::ptr::NonNull;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering::SeqCst;
 
@@ -10,6 +13,214 @@ use std::sync::atomic::Ordering::SeqCst;
 /// before any llama functions are called. This type is proof of initialization.
 #[derive(Eq, PartialEq, Debug)]
 pub struct LlamaBackend {}
+
+/// Scheduling priority for a native GGML thread pool.
+#[derive(Debug, Default, Eq, PartialEq, Copy, Clone)]
+pub enum LlamaThreadPoolPriority {
+    /// Lower than normal scheduling priority.
+    Low,
+    /// The platform's normal scheduling priority.
+    #[default]
+    Normal,
+    /// Medium scheduling priority.
+    Medium,
+    /// High scheduling priority.
+    High,
+    /// Real-time scheduling priority. The host may reject this priority for unprivileged callers.
+    Realtime,
+}
+
+impl From<LlamaThreadPoolPriority> for llama_cpp_sys_2::ggml_sched_priority {
+    fn from(value: LlamaThreadPoolPriority) -> Self {
+        match value {
+            LlamaThreadPoolPriority::Low => llama_cpp_sys_2::GGML_SCHED_PRIO_LOW,
+            LlamaThreadPoolPriority::Normal => llama_cpp_sys_2::GGML_SCHED_PRIO_NORMAL,
+            LlamaThreadPoolPriority::Medium => llama_cpp_sys_2::GGML_SCHED_PRIO_MEDIUM,
+            LlamaThreadPoolPriority::High => llama_cpp_sys_2::GGML_SCHED_PRIO_HIGH,
+            LlamaThreadPoolPriority::Realtime => llama_cpp_sys_2::GGML_SCHED_PRIO_REALTIME,
+        }
+    }
+}
+
+/// Parameters used to create a persistent native GGML thread pool.
+///
+/// [`Self::new`] starts with llama.cpp's own `ggml_threadpool_params_default` values. In
+/// particular, this gives the same empty CPU mask, non-strict affinity, polling interval, normal
+/// priority, and unpaused state used by `llama-bench` unless the caller overrides one of them.
+#[derive(Clone, Debug)]
+pub struct LlamaThreadPoolParams {
+    params: llama_cpp_sys_2::ggml_threadpool_params,
+}
+
+impl LlamaThreadPoolParams {
+    /// Construct llama.cpp's default thread-pool parameters for `n_threads` workers.
+    #[must_use]
+    pub fn new(n_threads: NonZeroI32) -> Self {
+        let params = unsafe { llama_cpp_sys_2::ggml_threadpool_params_default(n_threads.get()) };
+        Self { params }
+    }
+
+    /// Set whether workers must adhere strictly to the configured CPU affinity mask.
+    #[must_use]
+    pub fn with_strict_cpu(mut self, strict_cpu: bool) -> Self {
+        self.params.strict_cpu = strict_cpu;
+        self
+    }
+
+    /// Set the active-wait polling interval used by worker threads.
+    #[must_use]
+    pub fn with_poll(mut self, poll: u32) -> Self {
+        self.params.poll = poll;
+        self
+    }
+
+    /// Set the native scheduling priority for worker threads.
+    #[must_use]
+    pub fn with_priority(mut self, priority: LlamaThreadPoolPriority) -> Self {
+        self.params.prio = priority.into();
+        self
+    }
+
+    /// Set whether the pool is created in a paused state.
+    #[must_use]
+    pub fn with_paused(mut self, paused: bool) -> Self {
+        self.params.paused = paused;
+        self
+    }
+
+    /// Return the configured worker count.
+    #[must_use]
+    pub fn n_threads(&self) -> i32 {
+        self.params.n_threads
+    }
+
+    /// Return the configured polling interval.
+    #[must_use]
+    pub fn poll(&self) -> u32 {
+        self.params.poll
+    }
+
+    /// Return whether strict CPU affinity is enabled.
+    #[must_use]
+    pub fn strict_cpu(&self) -> bool {
+        self.params.strict_cpu
+    }
+
+    /// Return whether the pool starts paused.
+    #[must_use]
+    pub fn paused(&self) -> bool {
+        self.params.paused
+    }
+}
+
+type ThreadPoolFreeFn = unsafe extern "C" fn(*mut llama_cpp_sys_2::ggml_threadpool);
+
+/// An owned, persistent native GGML thread pool.
+///
+/// The backend lifetime prevents the native backend registry from being torn down before the pool.
+/// Attach this pool to a context with [`crate::context::LlamaContext::attach_threadpool`].
+pub struct LlamaThreadPool<'backend> {
+    threadpool: NonNull<llama_cpp_sys_2::ggml_threadpool>,
+    free: ThreadPoolFreeFn,
+    _backend: PhantomData<&'backend LlamaBackend>,
+}
+
+impl std::fmt::Debug for LlamaThreadPool<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("LlamaThreadPool")
+            .field("threadpool", &self.threadpool)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Failure to resolve or create the CPU backend's native thread pool.
+#[derive(Debug, Eq, PartialEq, thiserror::Error)]
+pub enum LlamaThreadPoolCreateError {
+    /// llama.cpp did not register a CPU backend device.
+    #[error("llama.cpp CPU backend is unavailable")]
+    CpuBackendUnavailable,
+    /// The CPU backend does not export a function required to own a thread pool.
+    #[error("llama.cpp CPU backend does not export {0}")]
+    MissingBackendFunction(&'static str),
+    /// The native thread-pool constructor returned a null pointer.
+    #[error("llama.cpp failed to create a native thread pool")]
+    NullReturn,
+}
+
+impl<'backend> LlamaThreadPool<'backend> {
+    /// Create a persistent thread pool from the registered CPU backend.
+    ///
+    /// Resolving the constructor through the backend registry, as `llama-bench` does, supports both
+    /// statically linked and dynamically loaded CPU backends.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the CPU backend or either thread-pool function is unavailable, or when
+    /// the native constructor returns null.
+    pub fn new(
+        _backend: &'backend LlamaBackend,
+        params: &LlamaThreadPoolParams,
+    ) -> Result<Self, LlamaThreadPoolCreateError> {
+        type ThreadPoolNewFn = unsafe extern "C" fn(
+            *mut llama_cpp_sys_2::ggml_threadpool_params,
+        )
+            -> *mut llama_cpp_sys_2::ggml_threadpool;
+
+        let cpu_device = NonNull::new(unsafe {
+            llama_cpp_sys_2::ggml_backend_dev_by_type(llama_cpp_sys_2::GGML_BACKEND_DEVICE_TYPE_CPU)
+        })
+        .ok_or(LlamaThreadPoolCreateError::CpuBackendUnavailable)?;
+        let cpu_registry = NonNull::new(unsafe {
+            llama_cpp_sys_2::ggml_backend_dev_backend_reg(cpu_device.as_ptr())
+        })
+        .ok_or(LlamaThreadPoolCreateError::CpuBackendUnavailable)?;
+
+        let new_address = NonNull::new(unsafe {
+            llama_cpp_sys_2::ggml_backend_reg_get_proc_address(
+                cpu_registry.as_ptr(),
+                c"ggml_threadpool_new".as_ptr(),
+            )
+        })
+        .ok_or(LlamaThreadPoolCreateError::MissingBackendFunction(
+            "ggml_threadpool_new",
+        ))?;
+        let free_address = NonNull::new(unsafe {
+            llama_cpp_sys_2::ggml_backend_reg_get_proc_address(
+                cpu_registry.as_ptr(),
+                c"ggml_threadpool_free".as_ptr(),
+            )
+        })
+        .ok_or(LlamaThreadPoolCreateError::MissingBackendFunction(
+            "ggml_threadpool_free",
+        ))?;
+
+        // SAFETY: the addresses were resolved by their exact names from llama.cpp's CPU backend;
+        // those exported functions have the signatures declared in ggml-cpu.h.
+        let create: ThreadPoolNewFn = unsafe { std::mem::transmute(new_address.as_ptr()) };
+        // SAFETY: see the matching constructor resolution above.
+        let free: ThreadPoolFreeFn = unsafe { std::mem::transmute(free_address.as_ptr()) };
+        let mut native_params = params.params;
+        let threadpool = NonNull::new(unsafe { create(&raw mut native_params) })
+            .ok_or(LlamaThreadPoolCreateError::NullReturn)?;
+
+        Ok(Self {
+            threadpool,
+            free,
+            _backend: PhantomData,
+        })
+    }
+
+    pub(crate) fn as_ptr(&mut self) -> *mut llama_cpp_sys_2::ggml_threadpool {
+        self.threadpool.as_ptr()
+    }
+}
+
+impl Drop for LlamaThreadPool<'_> {
+    fn drop(&mut self) {
+        unsafe { (self.free)(self.threadpool.as_ptr()) }
+    }
+}
 
 static LLAMA_BACKEND_INITIALIZED: AtomicBool = AtomicBool::new(false);
 
@@ -41,6 +252,10 @@ impl LlamaBackend {
     ///# Ok(())
     ///# }
     /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when another live backend owner already exists.
     #[tracing::instrument(skip_all)]
     pub fn init() -> crate::Result<LlamaBackend> {
         Self::mark_init()?;
@@ -61,6 +276,10 @@ impl LlamaBackend {
     ///# Ok(())
     ///# }
     /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when another live backend owner already exists.
     #[tracing::instrument(skip_all)]
     pub fn init_numa(strategy: NumaStrategy) -> crate::Result<LlamaBackend> {
         Self::mark_init()?;
@@ -71,16 +290,19 @@ impl LlamaBackend {
     }
 
     /// Was the code built for a GPU backend & is a supported one available.
+    #[must_use]
     pub fn supports_gpu_offload(&self) -> bool {
         unsafe { llama_cpp_sys_2::llama_supports_gpu_offload() }
     }
 
     /// Does this platform support loading the model via mmap.
+    #[must_use]
     pub fn supports_mmap(&self) -> bool {
         unsafe { llama_cpp_sys_2::llama_supports_mmap() }
     }
 
     /// Does this platform support locking the model in RAM.
+    #[must_use]
     pub fn supports_mlock(&self) -> bool {
         unsafe { llama_cpp_sys_2::llama_supports_mlock() }
     }
@@ -94,6 +316,7 @@ impl LlamaBackend {
         ) {
         }
 
+        let _logger_guard = crate::log::lock_native_logger();
         unsafe {
             llama_cpp_sys_2::llama_log_set(Some(void_log), std::ptr::null_mut());
         }

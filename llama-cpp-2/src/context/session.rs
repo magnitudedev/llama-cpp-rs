@@ -19,20 +19,52 @@ impl LlamaStateSeqFlags {
     /// without affecting the KV cache.
     pub const PARTIAL_ONLY: LlamaStateSeqFlags = LlamaStateSeqFlags(1);
 
+    /// Keep the state in native device buffers. Such a state is not readable as host bytes and is
+    /// intended only for native fast-path transfers.
+    pub const ON_DEVICE: LlamaStateSeqFlags = LlamaStateSeqFlags(2);
+
     /// Create an empty flags set.
+    #[must_use]
     pub const fn empty() -> LlamaStateSeqFlags {
         LlamaStateSeqFlags(0)
     }
 
     /// Get the raw flags value.
+    #[must_use]
     pub const fn bits(&self) -> u32 {
         self.0
     }
 
     /// Check if a flag is set.
+    #[must_use]
     pub const fn contains(&self, other: LlamaStateSeqFlags) -> bool {
         (self.0 & other.0) != 0
     }
+
+    /// Combine two state flags.
+    #[must_use]
+    pub const fn union(self, other: LlamaStateSeqFlags) -> LlamaStateSeqFlags {
+        LlamaStateSeqFlags(self.0 | other.0)
+    }
+}
+
+/// Failed to copy a per-sequence state into an owned host buffer.
+#[derive(Debug, Eq, PartialEq, thiserror::Error)]
+pub enum GetSeqStateDataError {
+    /// Device-resident state cannot be represented as an owned host byte vector.
+    #[error("ON_DEVICE sequence state requires a native device-state API")]
+    OnDevice,
+    /// llama.cpp reported a non-zero size but copied no bytes.
+    #[error("llama.cpp failed to copy sequence state")]
+    CopyFailed,
+    /// The native state grew between the size query and copy operation.
+    #[error("sequence state grew from {allocated} to {required} bytes during copy")]
+    SizeChanged {
+        /// Allocated capacity based on the first query.
+        allocated: usize,
+        /// Capacity required by the copy operation.
+        required: usize,
+    },
 }
 
 impl Default for LlamaStateSeqFlags {
@@ -196,7 +228,7 @@ impl LlamaContext<'_> {
                 cstr.as_ptr(),
                 tokens_out,
                 max_tokens,
-                &mut n_out,
+                &raw mut n_out,
             )
         };
         if load_session_success {
@@ -294,7 +326,7 @@ impl LlamaContext<'_> {
                 cstr.as_ptr(),
                 tokens_out,
                 max_tokens,
-                &mut n_out,
+                &raw mut n_out,
             )
         };
         if success {
@@ -404,7 +436,7 @@ impl LlamaContext<'_> {
                 dest_seq_id,
                 tokens_out,
                 max_tokens,
-                &mut n_out,
+                &raw mut n_out,
             )
         };
 
@@ -471,19 +503,59 @@ impl LlamaContext<'_> {
         }
     }
 
-    /// Copy the state of a single sequence into the specified buffer with optional flags.
+    /// Copy the state of a single sequence into an owned, correctly sized host buffer.
     ///
     /// This is the extended version that supports flags for partial state operations.
     ///
     /// # Parameters
     ///
-    /// * `dest` - Destination buffer to copy state into.
     /// * `seq_id` - The sequence ID to get the state for.
     /// * `flags` - Optional flags (e.g., [`LlamaStateSeqFlags::PARTIAL_ONLY`]).
     ///
+    /// # Errors
+    ///
+    /// Returns an error when on-device state is requested, allocation fails, or llama.cpp does not
+    /// write the expected number of bytes.
+    pub fn state_seq_get_data_ext_owned(
+        &self,
+        seq_id: i32,
+        flags: LlamaStateSeqFlags,
+    ) -> Result<Vec<u8>, GetSeqStateDataError> {
+        if flags.contains(LlamaStateSeqFlags::ON_DEVICE) {
+            return Err(GetSeqStateDataError::OnDevice);
+        }
+        let size = self.state_seq_get_size_ext(seq_id, flags);
+        if size == 0 {
+            return Ok(Vec::new());
+        }
+        let mut data = vec![0_u8; size];
+        let copied = unsafe {
+            llama_cpp_sys_2::llama_state_seq_get_data_ext(
+                self.context.as_ptr(),
+                data.as_mut_ptr(),
+                data.len(),
+                seq_id,
+                flags.0,
+            )
+        };
+        if copied == 0 {
+            return Err(GetSeqStateDataError::CopyFailed);
+        }
+        if copied > data.len() {
+            return Err(GetSeqStateDataError::SizeChanged {
+                allocated: data.len(),
+                required: copied,
+            });
+        }
+        data.truncate(copied);
+        Ok(data)
+    }
+
+    /// Copy the extended state of a single sequence into a caller-allocated buffer.
+    ///
     /// # Safety
     ///
-    /// Destination needs to have allocated enough memory.
+    /// `dest` must point to enough writable memory for the state selected by `seq_id` and `flags`.
     ///
     /// # Returns
     ///

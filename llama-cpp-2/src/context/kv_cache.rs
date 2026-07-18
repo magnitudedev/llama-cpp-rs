@@ -20,6 +20,21 @@ pub enum KvCacheConversionError {
 }
 
 impl LlamaContext<'_> {
+    /// Whether this model's active memory implementation supports sequence position shifting.
+    #[must_use]
+    pub fn memory_can_shift(&self) -> bool {
+        let mem = unsafe { llama_cpp_sys_2::llama_get_memory(self.context.as_ptr()) };
+        unsafe { llama_cpp_sys_2::llama_memory_can_shift(mem) }
+    }
+
+    /// Return the smallest position currently stored for a sequence, or a negative value when the
+    /// sequence has no resident state.
+    #[must_use]
+    pub fn memory_seq_pos_min(&self, seq_id: i32) -> i32 {
+        let mem = unsafe { llama_cpp_sys_2::llama_get_memory(self.context.as_ptr()) };
+        unsafe { llama_cpp_sys_2::llama_memory_seq_pos_min(mem, seq_id) }
+    }
+
     /// Copy the cache from one sequence to another.
     ///
     /// # Parameters
@@ -96,11 +111,21 @@ impl LlamaContext<'_> {
         Ok(unsafe { llama_cpp_sys_2::llama_memory_seq_rm(mem, src, p0, p1) })
     }
 
-    /// Clear the KV cache
-    pub fn clear_kv_cache(&mut self) {
+    /// Clear all context memory metadata and optionally zero its backing data buffers.
+    ///
+    /// Pass `false` for llama.cpp's fast logical reset used between `llama-bench` repetitions.
+    /// Pass `true` when cached data must also be overwritten.
+    pub fn clear_memory(&mut self, data: bool) {
         let mem = unsafe { llama_cpp_sys_2::llama_get_memory(self.context.as_ptr()) };
-        // clear both metadata and data buffers to match previous semantics
-        unsafe { llama_cpp_sys_2::llama_memory_clear(mem, true) }
+        unsafe { llama_cpp_sys_2::llama_memory_clear(mem, data) }
+    }
+
+    /// Clear the KV cache, including its backing data buffers.
+    ///
+    /// This compatibility alias preserves the method's historical zeroing behavior. Use
+    /// [`Self::clear_memory`] when the distinction is important.
+    pub fn clear_kv_cache(&mut self) {
+        self.clear_memory(true);
     }
 
     /// Removes all tokens that do not belong to the specified sequence

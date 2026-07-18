@@ -3,8 +3,7 @@ use std::ffi::{c_char, CStr, CString};
 use std::num::NonZeroU16;
 use std::os::raw::c_int;
 use std::path::Path;
-use std::ptr::{self, NonNull};
-use std::slice;
+use std::ptr::NonNull;
 use std::str::Utf8Error;
 
 use crate::context::params::LlamaContextParams;
@@ -47,21 +46,34 @@ pub struct LlamaChatTemplate(CString);
 impl LlamaChatTemplate {
     /// Create a new template from a string. This can either be the name of a llama.cpp [chat template](https://github.com/ggerganov/llama.cpp/blob/8a8c4ceb6050bd9392609114ca56ae6d26f5b8f5/src/llama-chat.cpp#L27-L61)
     /// like "chatml" or "llama3" or an actual Jinja template for llama.cpp to interpret.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `template` contains an interior NUL byte.
     pub fn new(template: &str) -> Result<Self, std::ffi::NulError> {
         Ok(Self(CString::new(template)?))
     }
 
     /// Accesses the template as a c string reference.
+    #[must_use]
     pub fn as_c_str(&self) -> &CStr {
         &self.0
     }
 
     /// Attempts to convert the `CString` into a Rust str reference.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the template bytes are not valid UTF-8.
     pub fn to_str(&self) -> Result<&str, Utf8Error> {
         self.0.to_str()
     }
 
     /// Convenience method to create an owned String.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the template bytes are not valid UTF-8.
     pub fn to_string(&self) -> Result<String, Utf8Error> {
         self.to_str().map(str::to_string)
     }
@@ -96,9 +108,13 @@ impl LlamaChatMessage {
 /// The Rope type that's used within the model.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RopeType {
+    /// Standard rotary position embedding.
     Norm,
+    /// NeoX-style rotary position embedding.
     NeoX,
+    /// Multi-axis rotary position embedding.
     MRope,
+    /// Vision-specific rotary position embedding.
     Vision,
 }
 
@@ -128,6 +144,7 @@ unsafe impl Send for LlamaModel {}
 
 unsafe impl Sync for LlamaModel {}
 
+#[allow(deprecated)]
 impl LlamaModel {
     pub(crate) fn vocab_ptr(&self) -> *const llama_cpp_sys_2::llama_vocab {
         unsafe { llama_cpp_sys_2::llama_model_get_vocab(self.model.as_ptr()) }
@@ -143,6 +160,12 @@ impl LlamaModel {
     pub fn n_ctx_train(&self) -> u32 {
         let n_ctx_train = unsafe { llama_cpp_sys_2::llama_n_ctx_train(self.model.as_ptr()) };
         u32::try_from(n_ctx_train).expect("n_ctx_train fits into an u32")
+    }
+
+    /// Get the model's sliding-window-attention span, or zero when it does not use SWA.
+    #[must_use]
+    pub fn n_swa(&self) -> i32 {
+        unsafe { llama_cpp_sys_2::llama_model_n_swa(self.model.as_ptr()) }
     }
 
     /// Get all tokens in the model.
@@ -166,6 +189,12 @@ impl LlamaModel {
     pub fn token_bos(&self) -> LlamaToken {
         let token = unsafe { llama_cpp_sys_2::llama_token_bos(self.vocab_ptr()) };
         LlamaToken(token)
+    }
+
+    /// Whether the model vocabulary requests a BOS token at the start of tokenized input.
+    #[must_use]
+    pub fn should_add_bos(&self) -> bool {
+        unsafe { llama_cpp_sys_2::llama_vocab_get_add_bos(self.vocab_ptr()) }
     }
 
     /// Get the end of stream token.
@@ -589,16 +618,19 @@ impl LlamaModel {
     }
 
     /// Returns the total size of all the tensors in the model in bytes.
+    #[must_use]
     pub fn size(&self) -> u64 {
         unsafe { llama_cpp_sys_2::llama_model_size(self.model.as_ptr()) }
     }
 
     /// Returns the number of parameters in the model.
+    #[must_use]
     pub fn n_params(&self) -> u64 {
         unsafe { llama_cpp_sys_2::llama_model_n_params(self.model.as_ptr()) }
     }
 
     /// Returns whether the model is a recurrent network (Mamba, RWKV, etc)
+    #[must_use]
     pub fn is_recurrent(&self) -> bool {
         unsafe { llama_cpp_sys_2::llama_model_is_recurrent(self.model.as_ptr()) }
     }
@@ -607,11 +639,17 @@ impl LlamaModel {
     ///
     /// Hybrid models have both attention layers and recurrent/SSM layers.
     /// They require special handling for state checkpointing.
+    #[must_use]
     pub fn is_hybrid(&self) -> bool {
         unsafe { llama_cpp_sys_2::llama_model_is_hybrid(self.model.as_ptr()) }
     }
 
     /// Returns the number of layers within the model.
+    ///
+    /// # Panics
+    ///
+    /// Panics if llama.cpp violates its contract and returns a negative layer count.
+    #[must_use]
     pub fn n_layer(&self) -> u32 {
         // It's never possible for this to panic because while the API interface is defined as an int32_t,
         // the field it's accessing is a uint32_t.
@@ -619,6 +657,11 @@ impl LlamaModel {
     }
 
     /// Returns the number of attention heads within the model.
+    ///
+    /// # Panics
+    ///
+    /// Panics if llama.cpp violates its contract and returns a negative head count.
+    #[must_use]
     pub fn n_head(&self) -> u32 {
         // It's never possible for this to panic because while the API interface is defined as an int32_t,
         // the field it's accessing is a uint32_t.
@@ -626,6 +669,11 @@ impl LlamaModel {
     }
 
     /// Returns the number of KV attention heads.
+    ///
+    /// # Panics
+    ///
+    /// Panics if llama.cpp violates its contract and returns a negative KV-head count.
+    #[must_use]
     pub fn n_head_kv(&self) -> u32 {
         // It's never possible for this to panic because while the API interface is defined as an int32_t,
         // the field it's accessing is a uint32_t.
@@ -634,6 +682,10 @@ impl LlamaModel {
     }
 
     /// Get metadata value as a string by key name
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for interior NUL bytes, missing keys, invalid UTF-8, or invalid native data.
     pub fn meta_val_str(&self, key: &str) -> Result<String, MetaValError> {
         let key_cstring = CString::new(key)?;
         let key_ptr = key_cstring.as_ptr();
@@ -652,11 +704,16 @@ impl LlamaModel {
     }
 
     /// Get the number of metadata key/value pairs
+    #[must_use]
     pub fn meta_count(&self) -> i32 {
         unsafe { llama_cpp_sys_2::llama_model_meta_count(self.model.as_ptr()) }
     }
 
     /// Get metadata key name by index
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid index, invalid UTF-8, or invalid native data.
     pub fn meta_key_by_index(&self, index: i32) -> Result<String, MetaValError> {
         extract_meta_string(
             |buf_ptr, buf_len| unsafe {
@@ -672,6 +729,10 @@ impl LlamaModel {
     }
 
     /// Get metadata value as a string by index
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid index, invalid UTF-8, or invalid native data.
     pub fn meta_val_str_by_index(&self, index: i32) -> Result<String, MetaValError> {
         extract_meta_string(
             |buf_ptr, buf_len| unsafe {
@@ -748,7 +809,11 @@ impl LlamaModel {
         params: &LlamaModelParams,
     ) -> Result<Self, LlamaModelLoadError> {
         let path = path.as_ref();
-        debug_assert!(Path::new(path).exists(), "{path:?} does not exist");
+        debug_assert!(
+            Path::new(path).exists(),
+            "{path} does not exist",
+            path = path.display()
+        );
         let path = path
             .to_str()
             .ok_or(LlamaModelLoadError::PathToStrError(path.to_path_buf()))?;
@@ -773,7 +838,11 @@ impl LlamaModel {
         path: impl AsRef<Path>,
     ) -> Result<LlamaLoraAdapter, LlamaLoraAdapterInitError> {
         let path = path.as_ref();
-        debug_assert!(Path::new(path).exists(), "{path:?} does not exist");
+        debug_assert!(
+            Path::new(path).exists(),
+            "{path} does not exist",
+            path = path.display()
+        );
 
         let path = path
             .to_str()
@@ -817,7 +886,7 @@ impl LlamaModel {
     /// Apply the models chat template to some messages.
     /// See <https://github.com/ggerganov/llama.cpp/wiki/Templates-supported-by-llama_chat_apply_template>
     ///
-    /// Unlike the llama.cpp `apply_chat_template` which just randomly uses the ChatML template when given
+    /// Unlike the llama.cpp `apply_chat_template` which just randomly uses the `ChatML` template when given
     /// a null pointer for the template, this requires an explicit template to be specified. If you want to
     /// use "chatml", then just do `LlamaChatTemplate::new("chatml")` or any other model name or template
     /// string.
@@ -830,7 +899,13 @@ impl LlamaModel {
     /// one into the output and the output may also have unexpected output aside from that.
     ///
     /// # Errors
+    ///
     /// There are many ways this can fail. See [`ApplyChatTemplateError`] for more information.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the combined input length overflows `usize` or cannot be represented by the native
+    /// chat-template API.
     #[tracing::instrument(skip_all)]
     pub fn apply_chat_template(
         &self,
@@ -911,7 +986,7 @@ where
     }
 
     // check if the response fit in our buffer
-    let returned_len = result as usize;
+    let returned_len = usize::try_from(result).expect("negative metadata lengths returned above");
     if returned_len >= capacity {
         // buffer wasn't large enough, try again with the correct capacity.
         return extract_meta_string(c_function, returned_len + 1);

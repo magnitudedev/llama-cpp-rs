@@ -1,8 +1,8 @@
 use std::num::NonZeroU32;
 
 use super::{
-    KvCacheType, LlamaAttentionType, LlamaContextParams, LlamaContextType, LlamaPoolingType,
-    RopeScalingType,
+    FlashAttentionPolicy, KvCacheType, LlamaAttentionType, LlamaContextParams, LlamaContextType,
+    LlamaPoolingType, RopeScalingType,
 };
 
 impl LlamaContextParams {
@@ -97,6 +97,24 @@ impl LlamaContextParams {
     #[must_use]
     pub fn n_ubatch(&self) -> u32 {
         self.context_params.n_ubatch
+    }
+
+    /// Set the maximum number of outputs retained for one physical batch.
+    ///
+    /// [`None`] delegates to llama.cpp's default, which resolves to [`Self::n_batch`]. An explicit
+    /// value is passed through unchanged; this binding does not apply serving-policy clamps.
+    #[must_use]
+    pub fn with_n_outputs_max(mut self, n_outputs_max: Option<NonZeroU32>) -> Self {
+        self.context_params.n_outputs_max = n_outputs_max.map_or(0, NonZeroU32::get);
+        self
+    }
+
+    /// Get the requested maximum number of outputs retained for one physical batch.
+    ///
+    /// [`None`] represents native zero and therefore requests llama.cpp's `n_batch` default.
+    #[must_use]
+    pub fn n_outputs_max(&self) -> Option<NonZeroU32> {
+        NonZeroU32::new(self.context_params.n_outputs_max)
     }
 
     /// Set the max number of sequences (i.e. distinct states for recurrent models)
@@ -324,6 +342,19 @@ impl LlamaContextParams {
         self.context_params.flash_attn_type
     }
 
+    /// Set the flash attention policy using the safe Rust enum.
+    #[must_use]
+    pub fn with_flash_attention(mut self, policy: FlashAttentionPolicy) -> Self {
+        self.context_params.flash_attn_type = policy.into();
+        self
+    }
+
+    /// Get the flash attention policy as the safe Rust enum.
+    #[must_use]
+    pub fn flash_attention(&self) -> FlashAttentionPolicy {
+        self.context_params.flash_attn_type.into()
+    }
+
     /// Set the rope frequency base
     ///
     /// # Examples
@@ -384,7 +415,7 @@ impl LlamaContextParams {
         self.context_params.rope_freq_scale
     }
 
-    /// Set the YaRN extrapolation mix factor
+    /// Set the `YaRN` extrapolation mix factor
     ///
     /// # Examples
     ///
@@ -399,13 +430,13 @@ impl LlamaContextParams {
         self
     }
 
-    /// Get the YaRN extrapolation mix factor
+    /// Get the `YaRN` extrapolation mix factor
     #[must_use]
     pub fn yarn_ext_factor(&self) -> f32 {
         self.context_params.yarn_ext_factor
     }
 
-    /// Set the YaRN magnitude scaling factor
+    /// Set the `YaRN` magnitude scaling factor
     ///
     /// # Examples
     ///
@@ -420,13 +451,13 @@ impl LlamaContextParams {
         self
     }
 
-    /// Get the YaRN magnitude scaling factor
+    /// Get the `YaRN` magnitude scaling factor
     #[must_use]
     pub fn yarn_attn_factor(&self) -> f32 {
         self.context_params.yarn_attn_factor
     }
 
-    /// Set the YaRN low correction dim
+    /// Set the `YaRN` low correction dim
     ///
     /// # Examples
     ///
@@ -441,13 +472,13 @@ impl LlamaContextParams {
         self
     }
 
-    /// Get the YaRN low correction dim
+    /// Get the `YaRN` low correction dim
     #[must_use]
     pub fn yarn_beta_fast(&self) -> f32 {
         self.context_params.yarn_beta_fast
     }
 
-    /// Set the YaRN high correction dim
+    /// Set the `YaRN` high correction dim
     ///
     /// # Examples
     ///
@@ -462,13 +493,13 @@ impl LlamaContextParams {
         self
     }
 
-    /// Get the YaRN high correction dim
+    /// Get the `YaRN` high correction dim
     #[must_use]
     pub fn yarn_beta_slow(&self) -> f32 {
         self.context_params.yarn_beta_slow
     }
 
-    /// Set the YaRN original context size
+    /// Set the `YaRN` original context size
     ///
     /// # Examples
     ///
@@ -483,7 +514,7 @@ impl LlamaContextParams {
         self
     }
 
-    /// Get the YaRN original context size
+    /// Get the `YaRN` original context size
     #[must_use]
     pub fn yarn_orig_ctx(&self) -> u32 {
         self.context_params.yarn_orig_ctx

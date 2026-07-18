@@ -1166,6 +1166,7 @@ dependencies = [
  "enumflags2",
  "llama-cpp-sys-2",
  "llguidance",
+ "serde",
  "thiserror",
  "toktrie",
  "tracing",

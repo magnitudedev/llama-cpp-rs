@@ -14,7 +14,9 @@
 //!
 //! - `cuda` enables CUDA gpu support.
 //! - `sampler` adds the [`context::sample::sampler`] struct for a more rusty way of sampling.
-use std::ffi::{c_char, CStr, CString, NulError};
+use std::ffi::{c_char, NulError};
+#[cfg(feature = "common")]
+use std::ffi::{CStr, CString};
 use std::fmt::Debug;
 use std::num::NonZeroI32;
 
@@ -23,6 +25,10 @@ use std::os::raw::c_int;
 use std::path::PathBuf;
 use std::string::FromUtf8Error;
 
+#[cfg(feature = "common")]
+pub mod common_chat;
+#[cfg(feature = "common")]
+pub mod common_sampling;
 pub mod context;
 pub mod gguf;
 pub mod llama_backend;
@@ -141,6 +147,9 @@ pub enum DecodeError {
     /// No kv cache slot was available.
     #[error("Decode Error 1: NoKvCacheSlot")]
     NoKvCacheSlot,
+    /// Native execution was interrupted by the configured abort callback.
+    #[error("Decode Error 2: Aborted")]
+    Aborted,
     /// The number of tokens in the batch was 0.
     #[error("Decode Error -1: n_tokens == 0")]
     NTokensZero,
@@ -199,6 +208,7 @@ impl From<NonZeroI32> for DecodeError {
     fn from(value: NonZeroI32) -> Self {
         match value.get() {
             1 => DecodeError::NoKvCacheSlot,
+            2 => DecodeError::Aborted,
             -1 => DecodeError::NTokensZero,
             i => DecodeError::Unknown(i),
         }
@@ -311,20 +321,24 @@ pub fn mlock_supported() -> bool {
 }
 
 /// Convert a JSON schema string into a llama.cpp grammar string.
+///
+/// # Errors
+///
+/// Returns an error when the schema contains an interior NUL byte, llama.cpp rejects it, or the
+/// native output is not valid UTF-8.
 #[cfg(feature = "common")]
 pub fn json_schema_to_grammar(schema_json: &str) -> Result<String> {
     let schema_cstr = CString::new(schema_json)
         .map_err(|err| LlamaCppError::JsonSchemaToGrammarError(err.to_string()))?;
     let mut out = std::ptr::null_mut();
     let rc = unsafe {
-        llama_cpp_sys_2::llama_rs_json_schema_to_grammar(schema_cstr.as_ptr(), false, &mut out)
+        llama_cpp_sys_2::llama_rs_json_schema_to_grammar(schema_cstr.as_ptr(), false, &raw mut out)
     };
 
     let result = {
         if !status_is_ok(rc) || out.is_null() {
             return Err(LlamaCppError::JsonSchemaToGrammarError(format!(
-                "ffi error {}",
-                rc
+                "ffi error {rc}"
             )));
         }
         let grammar_bytes = unsafe { CStr::from_ptr(out) }.to_bytes().to_vec();
@@ -482,7 +496,7 @@ pub struct LlamaBackendDevice {
     pub index: usize,
     /// The name of the device (e.g. "Vulkan0")
     pub name: String,
-    /// A description of the device (e.g. "NVIDIA GeForce RTX 3080")
+    /// A description of the device (e.g. "NVIDIA `GeForce` RTX 3080")
     pub description: String,
     /// The backend of the device (e.g. "Vulkan", "CUDA", "CPU")
     pub backend: String,
@@ -611,9 +625,10 @@ pub fn send_logs_to_tracing(options: LogOptions) {
             .get_or_init(|| Box::new(log::State::new(log::Module::LlamaCpp, options.clone()))),
     ) as *const _;
     let ggml_heap_state = Box::as_ref(
-        log::GGML_STATE.get_or_init(|| Box::new(log::State::new(log::Module::GGML, options))),
+        log::GGML_STATE.get_or_init(|| Box::new(log::State::new(log::Module::Ggml, options))),
     ) as *const _;
 
+    let _logger_guard = log::lock_native_logger();
     unsafe {
         // GGML has to be set after llama since setting llama sets ggml as well.
         llama_cpp_sys_2::llama_log_set(Some(logs_to_trace), llama_heap_state as *mut _);

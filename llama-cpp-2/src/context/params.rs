@@ -1,6 +1,37 @@
 //! A safe wrapper around `llama_context_params`.
 mod get_set;
 
+/// Policy controlling whether llama.cpp may use Flash Attention.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum FlashAttentionPolicy {
+    /// Let llama.cpp select the appropriate implementation.
+    Auto,
+    /// Force Flash Attention off.
+    Disabled,
+    /// Force Flash Attention on, failing if the selected backend cannot support it.
+    Enabled,
+}
+
+impl From<llama_cpp_sys_2::llama_flash_attn_type> for FlashAttentionPolicy {
+    fn from(value: llama_cpp_sys_2::llama_flash_attn_type) -> Self {
+        match value {
+            llama_cpp_sys_2::LLAMA_FLASH_ATTN_TYPE_DISABLED => Self::Disabled,
+            llama_cpp_sys_2::LLAMA_FLASH_ATTN_TYPE_ENABLED => Self::Enabled,
+            _ => Self::Auto,
+        }
+    }
+}
+
+impl From<FlashAttentionPolicy> for llama_cpp_sys_2::llama_flash_attn_type {
+    fn from(value: FlashAttentionPolicy) -> Self {
+        match value {
+            FlashAttentionPolicy::Auto => llama_cpp_sys_2::LLAMA_FLASH_ATTN_TYPE_AUTO,
+            FlashAttentionPolicy::Disabled => llama_cpp_sys_2::LLAMA_FLASH_ATTN_TYPE_DISABLED,
+            FlashAttentionPolicy::Enabled => llama_cpp_sys_2::LLAMA_FLASH_ATTN_TYPE_ENABLED,
+        }
+    }
+}
+
 /// A rusty wrapper around `rope_scaling_type`.
 #[repr(i8)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]

@@ -11,7 +11,10 @@ use crate::status_is_ok;
 use crate::token::data_array::LlamaTokenDataArray;
 use crate::token::logit_bias::LlamaLogitBias;
 use crate::token::LlamaToken;
-use crate::{GrammarError, SamplerAcceptError};
+#[cfg(any(feature = "common", feature = "llguidance"))]
+use crate::GrammarError;
+#[cfg(feature = "common")]
+use crate::SamplerAcceptError;
 
 /// A safe wrapper around `llama_sampler`.
 pub struct LlamaSampler {
@@ -73,6 +76,10 @@ impl LlamaSampler {
     }
 
     /// Try accepting a token from the sampler. Returns an error if the sampler throws.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SamplerAcceptError::FfiError`] when llama.cpp rejects the token.
     #[cfg(feature = "common")]
     pub fn try_accept(&mut self, token: LlamaToken) -> Result<(), SamplerAcceptError> {
         let sampler_result =
@@ -96,7 +103,7 @@ impl LlamaSampler {
     /// Gets the random seed used by this sampler.
     ///
     /// Returns:
-    /// - For random samplers (dist, mirostat, mirostat_v2): returns their current seed
+    /// - For random samplers (dist, mirostat, `mirostat_v2)`: returns their current seed
     /// - For sampler chains: returns the first non-default seed found in reverse order
     /// - For all other samplers: returns 0xFFFFFFFF
     #[must_use]
@@ -296,8 +303,11 @@ impl LlamaSampler {
     }
 
     /// Grammar sampler
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid grammar strings or if native sampler creation fails.
     #[cfg(feature = "common")]
-    #[must_use]
     pub fn grammar(
         model: &LlamaModel,
         grammar_str: &str,
@@ -324,8 +334,11 @@ impl LlamaSampler {
     /// Lazy grammar sampler, introduced in <https://github.com/ggerganov/llama.cpp/pull/9639>
     ///
     /// This sampler enforces grammar rules only when specific trigger words or tokens are encountered.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid grammar or trigger strings, or native creation failure.
     #[cfg(feature = "common")]
-    #[must_use]
     pub fn grammar_lazy(
         model: &LlamaModel,
         grammar_str: &str,
@@ -364,8 +377,11 @@ impl LlamaSampler {
     /// Trigger patterns are regular expressions matched from the start of the
     /// generation output. The grammar sampler will be fed content starting from
     /// the first match group.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid grammar or trigger patterns, or native creation failure.
     #[cfg(feature = "common")]
-    #[must_use]
     pub fn grammar_lazy_patterns(
         model: &LlamaModel,
         grammar_str: &str,
@@ -416,6 +432,7 @@ impl LlamaSampler {
         crate::llguidance_sampler::create_llg_sampler(model, grammar_kind, grammar_data)
     }
 
+    #[cfg(feature = "common")]
     fn sanitize_grammar_strings(
         grammar_str: &str,
         grammar_root: &str,
@@ -434,6 +451,7 @@ impl LlamaSampler {
         ))
     }
 
+    #[cfg(feature = "common")]
     fn sanitize_trigger_words(
         trigger_words: impl IntoIterator<Item = impl AsRef<[u8]>>,
     ) -> Result<Vec<CString>, GrammarError> {
@@ -450,6 +468,7 @@ impl LlamaSampler {
             .collect())
     }
 
+    #[cfg(feature = "common")]
     fn sanitize_trigger_patterns(
         trigger_patterns: &[String],
     ) -> Result<Vec<CString>, GrammarError> {
@@ -621,13 +640,17 @@ impl LlamaSampler {
     /// // Assuming vocab_size of 32000
     /// let sampler = LlamaSampler::logit_bias(32000, &biases);
     /// ```
+    ///
+    /// # Panics
+    ///
+    /// Panics when the bias count exceeds the native API's signed 32-bit limit.
     #[must_use]
     pub fn logit_bias(n_vocab: i32, biases: &[LlamaLogitBias]) -> Self {
         let data = biases.as_ptr().cast::<llama_cpp_sys_2::llama_logit_bias>();
+        let bias_count = i32::try_from(biases.len()).expect("logit-bias count exceeds i32::MAX");
 
-        let sampler = unsafe {
-            llama_cpp_sys_2::llama_sampler_init_logit_bias(n_vocab, biases.len() as i32, data)
-        };
+        let sampler =
+            unsafe { llama_cpp_sys_2::llama_sampler_init_logit_bias(n_vocab, bias_count, data) };
 
         Self { sampler }
     }

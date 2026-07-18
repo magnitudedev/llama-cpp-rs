@@ -13,7 +13,7 @@ pub struct LlamaBatch<'a> {
     pub(crate) initialized_logits: Vec<i32>,
     #[allow(clippy::doc_markdown)]
     /// The llama_cpp batch. always initialize by `llama_cpp_sys_2::llama_batch_init(allocated, <unknown>, <unknown>)`
-    pub(crate) llama_batch: llama_batch,
+    pub(crate) raw: llama_batch,
     phantom: PhantomData<&'a [LlamaToken]>,
 }
 
@@ -32,7 +32,7 @@ impl<'a> LlamaBatch<'a> {
     /// Clear the batch. This does not free the memory associated with the batch, but it does reset
     /// the number of tokens to 0.
     pub fn clear(&mut self) {
-        self.llama_batch.n_tokens = 0;
+        self.raw.n_tokens = 0;
         self.initialized_logits.clear();
     }
 
@@ -41,7 +41,7 @@ impl<'a> LlamaBatch<'a> {
     ///
     /// # Panics
     ///
-    /// - [`self.llama_batch.n_tokens`] does not fit into a usize
+    /// - [`self.raw.n_tokens`] does not fit into a usize
     /// - [`seq_ids.len()`] does not fit into a [`llama_seq_id`]
     ///
     /// # Errors
@@ -59,15 +59,15 @@ impl<'a> LlamaBatch<'a> {
         {
             return Err(BatchAddError::InsufficientSpace(self.allocated));
         }
-        let offset = self.llama_batch.n_tokens;
+        let offset = self.raw.n_tokens;
         let offset_usize = usize::try_from(offset).expect("cannot fit n_tokens into a usize");
         unsafe {
             // batch.token   [batch.n_tokens] = id;
-            self.llama_batch.token.add(offset_usize).write(id);
+            self.raw.token.add(offset_usize).write(id);
             // batch.pos     [batch.n_tokens] = pos,
-            self.llama_batch.pos.add(offset_usize).write(pos);
+            self.raw.pos.add(offset_usize).write(pos);
             // batch.n_seq_id[batch.n_tokens] = seq_ids.size();
-            self.llama_batch.n_seq_id.add(offset_usize).write(
+            self.raw.n_seq_id.add(offset_usize).write(
                 llama_seq_id::try_from(seq_ids.len())
                     .expect("cannot fit seq_ids.len() into a llama_seq_id"),
             );
@@ -75,14 +75,11 @@ impl<'a> LlamaBatch<'a> {
             //     batch.seq_id[batch.n_tokens][i] = seq_ids[i];
             // }
             for (i, seq_id) in seq_ids.iter().enumerate() {
-                let tmp = *self.llama_batch.seq_id.add(offset_usize);
+                let tmp = *self.raw.seq_id.add(offset_usize);
                 tmp.add(i).write(*seq_id);
             }
             // batch.logits  [batch.n_tokens] = logits;
-            self.llama_batch
-                .logits
-                .add(offset_usize)
-                .write(i8::from(logits));
+            self.raw.logits.add(offset_usize).write(i8::from(logits));
         }
 
         if logits {
@@ -92,7 +89,7 @@ impl<'a> LlamaBatch<'a> {
         }
 
         // batch.n_tokens++;
-        self.llama_batch.n_tokens += 1;
+        self.raw.n_tokens += 1;
 
         Ok(())
     }
@@ -108,7 +105,7 @@ impl<'a> LlamaBatch<'a> {
     ///
     /// # Panics
     ///
-    /// - [`self.llama_batch.n_tokens`] does not fit into a [`usize`]
+    /// - [`self.raw.n_tokens`] does not fit into a [`usize`]
     /// - [`n_tokens - 1`] does not fit into a [`llama_pos`]
     pub fn add_sequence(
         &mut self,
@@ -117,7 +114,7 @@ impl<'a> LlamaBatch<'a> {
         logits_all: bool,
     ) -> Result<(), BatchAddError> {
         let n_tokens_0 =
-            usize::try_from(self.llama_batch.n_tokens).expect("cannot fit n_tokens into a usize");
+            usize::try_from(self.raw.n_tokens).expect("cannot fit n_tokens into a usize");
         let n_tokens = tokens.len();
 
         if self.allocated < n_tokens_0 + n_tokens {
@@ -151,7 +148,7 @@ impl<'a> LlamaBatch<'a> {
         LlamaBatch {
             allocated: n_tokens,
             initialized_logits: vec![],
-            llama_batch: batch,
+            raw: batch,
             phantom: PhantomData,
         }
     }
@@ -185,7 +182,7 @@ impl<'a> LlamaBatch<'a> {
             initialized_logits: vec![(tokens.len() - 1)
                 .try_into()
                 .expect("number of tokens exceeds i32::MAX + 1")],
-            llama_batch: batch,
+            raw: batch,
             phantom: PhantomData,
         };
         Ok(batch)
@@ -194,11 +191,11 @@ impl<'a> LlamaBatch<'a> {
     /// Returns the number of tokens in the batch.
     #[must_use]
     pub fn n_tokens(&self) -> i32 {
-        self.llama_batch.n_tokens
+        self.raw.n_tokens
     }
 }
 
-impl<'a> Drop for LlamaBatch<'a> {
+impl Drop for LlamaBatch<'_> {
     /// Drops the `LlamaBatch`.
     ///
     /// ```
@@ -213,7 +210,7 @@ impl<'a> Drop for LlamaBatch<'a> {
     fn drop(&mut self) {
         unsafe {
             if self.allocated > 0 {
-                llama_batch_free(self.llama_batch);
+                llama_batch_free(self.raw);
             }
         }
     }

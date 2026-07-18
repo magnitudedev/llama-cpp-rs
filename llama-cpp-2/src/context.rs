@@ -2,9 +2,14 @@
 
 use std::fmt::{Debug, Formatter};
 use std::num::NonZeroI32;
+use std::ops::{Deref, DerefMut};
+use std::os::raw::c_void;
 use std::ptr::NonNull;
 use std::slice;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
+use crate::llama_backend::LlamaThreadPool;
 use crate::llama_batch::LlamaBatch;
 use crate::model::{LlamaLoraAdapter, LlamaModel};
 use crate::timing::LlamaTimings;
@@ -17,6 +22,8 @@ use crate::{
 };
 
 pub mod kv_cache;
+#[cfg(feature = "common")]
+pub mod memory;
 pub mod params;
 pub mod session;
 
@@ -28,6 +35,113 @@ pub struct LlamaContext<'a> {
     pub model: &'a LlamaModel,
     initialized_logits: Vec<i32>,
     embeddings_enabled: bool,
+    abort_callback: Option<Arc<AtomicBool>>,
+}
+
+/// A thread-safe cancellation handle for an installed llama.cpp abort callback.
+///
+/// The callback itself is owned by the associated [`LlamaContext`]. Dropping this handle does not
+/// remove the callback; it only gives up one way to signal it.
+#[derive(Clone, Debug)]
+pub struct LlamaAbortHandle {
+    cancelled: Arc<AtomicBool>,
+}
+
+/// A context with a persistent native GGML thread pool attached.
+///
+/// The guard exclusively borrows both resources, so neither the context nor the pool can be moved
+/// or dropped while llama.cpp retains the pool pointer. Dropping (or explicitly detaching) the guard
+/// first detaches the pool from the native context.
+#[derive(Debug)]
+pub struct LlamaThreadPoolAttachment<'context, 'pool, 'model, 'backend> {
+    context: &'context mut LlamaContext<'model>,
+    _threadpool: &'pool mut LlamaThreadPool<'backend>,
+}
+
+/// Lifetime-safe attachment of distinct generation and prompt-processing pools.
+#[derive(Debug)]
+pub struct LlamaThreadPoolsAttachment<'context, 'main, 'batch, 'model, 'backend> {
+    context: &'context mut LlamaContext<'model>,
+    _main_threadpool: &'main mut LlamaThreadPool<'backend>,
+    _batch_threadpool: &'batch mut LlamaThreadPool<'backend>,
+}
+
+impl LlamaThreadPoolsAttachment<'_, '_, '_, '_, '_> {
+    /// Detach both pools before the guard would otherwise leave scope.
+    pub fn detach(self) {}
+}
+
+impl<'model> Deref for LlamaThreadPoolsAttachment<'_, '_, '_, 'model, '_> {
+    type Target = LlamaContext<'model>;
+
+    fn deref(&self) -> &Self::Target {
+        self.context
+    }
+}
+
+impl DerefMut for LlamaThreadPoolsAttachment<'_, '_, '_, '_, '_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.context
+    }
+}
+
+impl Drop for LlamaThreadPoolsAttachment<'_, '_, '_, '_, '_> {
+    fn drop(&mut self) {
+        unsafe { llama_cpp_sys_2::llama_detach_threadpool(self.context.context.as_ptr()) }
+    }
+}
+
+impl LlamaThreadPoolAttachment<'_, '_, '_, '_> {
+    /// Detach the thread pool before the guard would otherwise leave scope.
+    pub fn detach(self) {}
+}
+
+impl<'model> Deref for LlamaThreadPoolAttachment<'_, '_, 'model, '_> {
+    type Target = LlamaContext<'model>;
+
+    fn deref(&self) -> &Self::Target {
+        self.context
+    }
+}
+
+impl DerefMut for LlamaThreadPoolAttachment<'_, '_, '_, '_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.context
+    }
+}
+
+impl Drop for LlamaThreadPoolAttachment<'_, '_, '_, '_> {
+    fn drop(&mut self) {
+        unsafe { llama_cpp_sys_2::llama_detach_threadpool(self.context.context.as_ptr()) }
+    }
+}
+
+impl LlamaAbortHandle {
+    /// Request cancellation of the current native evaluation.
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+    }
+
+    /// Clear a previous cancellation request before starting another evaluation.
+    pub fn reset(&self) {
+        self.cancelled.store(false, Ordering::Release);
+    }
+
+    /// Whether cancellation has been requested.
+    #[must_use]
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
+}
+
+unsafe extern "C" fn abort_if_cancelled(data: *mut c_void) -> bool {
+    if data.is_null() {
+        return false;
+    }
+    // SAFETY: `install_abort_callback` stores this allocation on the context and unregisters the
+    // callback before replacing or dropping it.
+    let cancelled = unsafe { &*data.cast::<AtomicBool>() };
+    cancelled.load(Ordering::Acquire)
 }
 
 impl Debug for LlamaContext<'_> {
@@ -39,6 +153,11 @@ impl Debug for LlamaContext<'_> {
 }
 
 impl<'model> LlamaContext<'model> {
+    #[cfg(feature = "common")]
+    pub(crate) fn has_initialized_logits(&self, index: i32) -> bool {
+        logits_index_is_initialized(&self.initialized_logits, index)
+    }
+
     pub(crate) fn new(
         llama_model: &'model LlamaModel,
         llama_context: NonNull<llama_cpp_sys_2::llama_context>,
@@ -49,6 +168,7 @@ impl<'model> LlamaContext<'model> {
             model: llama_model,
             initialized_logits: Vec::new(),
             embeddings_enabled,
+            abort_callback: None,
         }
     }
 
@@ -70,6 +190,130 @@ impl<'model> LlamaContext<'model> {
         unsafe { llama_cpp_sys_2::llama_n_ctx(self.context.as_ptr()) }
     }
 
+    /// Gets the effective context capacity available to each sequence.
+    #[must_use]
+    pub fn n_ctx_seq(&self) -> u32 {
+        unsafe { llama_cpp_sys_2::llama_n_ctx_seq(self.context.as_ptr()) }
+    }
+
+    /// Gets the recurrent-state sequence capacity.
+    #[must_use]
+    pub fn n_rs_seq(&self) -> u32 {
+        unsafe { llama_cpp_sys_2::llama_n_rs_seq(self.context.as_ptr()) }
+    }
+
+    /// Gets the effective maximum number of sequences supported by this context.
+    #[must_use]
+    pub fn n_seq_max(&self) -> u32 {
+        unsafe { llama_cpp_sys_2::llama_n_seq_max(self.context.as_ptr()) }
+    }
+
+    /// Gets the current thread count used for single-token generation.
+    #[must_use]
+    pub fn n_threads(&self) -> i32 {
+        unsafe { llama_cpp_sys_2::llama_n_threads(self.context.as_ptr()) }
+    }
+
+    /// Gets the current thread count used for batched prompt processing.
+    #[must_use]
+    pub fn n_threads_batch(&self) -> i32 {
+        unsafe { llama_cpp_sys_2::llama_n_threads_batch(self.context.as_ptr()) }
+    }
+
+    /// Update the generation and prompt-processing thread counts.
+    pub fn set_n_threads(&mut self, n_threads: i32, n_threads_batch: i32) {
+        unsafe {
+            llama_cpp_sys_2::llama_set_n_threads(self.context.as_ptr(), n_threads, n_threads_batch);
+        }
+    }
+
+    /// Attach one persistent GGML thread pool for both generation and batched prompt processing.
+    ///
+    /// This matches `llama_attach_threadpool(ctx, threadpool, nullptr)`, the configuration used by
+    /// `llama-bench`. The returned guard provides context access and detaches automatically.
+    pub fn attach_threadpool<'context, 'pool, 'backend>(
+        &'context mut self,
+        threadpool: &'pool mut LlamaThreadPool<'backend>,
+    ) -> LlamaThreadPoolAttachment<'context, 'pool, 'model, 'backend> {
+        unsafe {
+            llama_cpp_sys_2::llama_attach_threadpool(
+                self.context.as_ptr(),
+                threadpool.as_ptr(),
+                std::ptr::null_mut(),
+            );
+        }
+        LlamaThreadPoolAttachment {
+            context: self,
+            _threadpool: threadpool,
+        }
+    }
+
+    /// Attach distinct persistent pools for generation and batched prompt processing.
+    pub fn attach_threadpools<'context, 'main, 'batch, 'backend>(
+        &'context mut self,
+        main_threadpool: &'main mut LlamaThreadPool<'backend>,
+        batch_threadpool: &'batch mut LlamaThreadPool<'backend>,
+    ) -> LlamaThreadPoolsAttachment<'context, 'main, 'batch, 'model, 'backend> {
+        unsafe {
+            llama_cpp_sys_2::llama_attach_threadpool(
+                self.context.as_ptr(),
+                main_threadpool.as_ptr(),
+                batch_threadpool.as_ptr(),
+            );
+        }
+        LlamaThreadPoolsAttachment {
+            context: self,
+            _main_threadpool: main_threadpool,
+            _batch_threadpool: batch_threadpool,
+        }
+    }
+
+    /// Block until all asynchronous backend work for this context has completed.
+    pub fn synchronize(&mut self) {
+        unsafe { llama_cpp_sys_2::llama_synchronize(self.context.as_ptr()) }
+    }
+
+    /// Install a lifetime-safe native abort callback and return its cancellation handle.
+    ///
+    /// llama.cpp currently checks this callback only on backends that support native aborts. Callers
+    /// must still check the handle between decode calls for portable cancellation.
+    pub fn install_abort_callback(&mut self) -> LlamaAbortHandle {
+        self.install_abort_callback_with_flag(Arc::new(AtomicBool::new(false)))
+    }
+
+    /// Install a native abort callback backed by a caller-owned cancellation flag.
+    pub fn install_abort_callback_with_flag(
+        &mut self,
+        cancelled: Arc<AtomicBool>,
+    ) -> LlamaAbortHandle {
+        self.clear_abort_callback();
+        let callback_state = Arc::clone(&cancelled);
+        let callback_data = Arc::as_ptr(&callback_state).cast_mut().cast::<c_void>();
+        unsafe {
+            llama_cpp_sys_2::llama_set_abort_callback(
+                self.context.as_ptr(),
+                Some(abort_if_cancelled),
+                callback_data,
+            );
+        }
+        self.abort_callback = Some(callback_state);
+        LlamaAbortHandle { cancelled }
+    }
+
+    /// Remove the currently installed native abort callback, if any.
+    pub fn clear_abort_callback(&mut self) {
+        if self.abort_callback.is_some() {
+            unsafe {
+                llama_cpp_sys_2::llama_set_abort_callback(
+                    self.context.as_ptr(),
+                    None,
+                    std::ptr::null_mut(),
+                );
+            }
+            self.abort_callback = None;
+        }
+    }
+
     /// Decodes the batch.
     ///
     /// # Errors
@@ -80,8 +324,7 @@ impl<'model> LlamaContext<'model> {
     ///
     /// - the returned [`std::ffi::c_int`] from llama-cpp does not fit into a i32 (this should never happen on most systems)
     pub fn decode(&mut self, batch: &mut LlamaBatch) -> Result<(), DecodeError> {
-        let result =
-            unsafe { llama_cpp_sys_2::llama_decode(self.context.as_ptr(), batch.llama_batch) };
+        let result = unsafe { llama_cpp_sys_2::llama_decode(self.context.as_ptr(), batch.raw) };
 
         match NonZeroI32::new(result) {
             None => {
@@ -103,8 +346,7 @@ impl<'model> LlamaContext<'model> {
     ///
     /// - the returned [`std::ffi::c_int`] from llama-cpp does not fit into a i32 (this should never happen on most systems)
     pub fn encode(&mut self, batch: &mut LlamaBatch) -> Result<(), EncodeError> {
-        let result =
-            unsafe { llama_cpp_sys_2::llama_encode(self.context.as_ptr(), batch.llama_batch) };
+        let result = unsafe { llama_cpp_sys_2::llama_encode(self.context.as_ptr(), batch.raw) };
 
         match NonZeroI32::new(result) {
             None => {
@@ -370,8 +612,41 @@ impl<'model> LlamaContext<'model> {
     }
 }
 
+#[cfg(any(feature = "common", test))]
+fn logits_index_is_initialized(initialized: &[i32], index: i32) -> bool {
+    if index >= 0 {
+        return initialized.contains(&index);
+    }
+
+    // llama.cpp interprets negative indices as rows counted backwards from the
+    // compact output buffer. Avoid entering its aborting error path when no
+    // output exists or the negative index is out of range.
+    let output_count = i64::try_from(initialized.len()).unwrap_or(i64::MAX);
+    !initialized.is_empty() && i64::from(index) >= -output_count
+}
+
 impl Drop for LlamaContext<'_> {
     fn drop(&mut self) {
+        self.clear_abort_callback();
         unsafe { llama_cpp_sys_2::llama_free(self.context.as_ptr()) }
+    }
+}
+
+#[cfg(test)]
+mod output_index_tests {
+    use super::logits_index_is_initialized;
+
+    #[test]
+    fn validates_batch_and_negative_output_indices() {
+        assert!(!logits_index_is_initialized(&[], 0));
+        assert!(!logits_index_is_initialized(&[], -1));
+
+        let outputs = [2, 7];
+        assert!(logits_index_is_initialized(&outputs, 2));
+        assert!(logits_index_is_initialized(&outputs, 7));
+        assert!(!logits_index_is_initialized(&outputs, 0));
+        assert!(logits_index_is_initialized(&outputs, -1));
+        assert!(logits_index_is_initialized(&outputs, -2));
+        assert!(!logits_index_is_initialized(&outputs, -3));
     }
 }

@@ -21,6 +21,7 @@ impl GgufContext {
     ///
     /// Returns `None` if the path contains a null byte, the file does not
     /// exist, or the file is not a valid GGUF file.
+    #[must_use]
     pub fn from_file(path: &Path) -> Option<Self> {
         let c_path = CString::new(path.to_str()?).ok()?;
         let params = llama_cpp_sys_2::gguf_init_params {
@@ -34,11 +35,13 @@ impl GgufContext {
     }
 
     /// Total number of key-value pairs in the metadata.
+    #[must_use]
     pub fn n_kv(&self) -> i64 {
         unsafe { llama_cpp_sys_2::gguf_get_n_kv(self.ctx.as_ptr()) }
     }
 
     /// Find the index of a key by name. Returns `-1` if not found.
+    #[must_use]
     pub fn find_key(&self, key: &str) -> i64 {
         let Ok(c_key) = CString::new(key) else {
             return -1;
@@ -47,6 +50,7 @@ impl GgufContext {
     }
 
     /// Return the key name at the given index, or `None` if out of range.
+    #[must_use]
     pub fn key_at(&self, idx: i64) -> Option<&str> {
         let ptr = unsafe { llama_cpp_sys_2::gguf_get_key(self.ctx.as_ptr(), idx) };
         if ptr.is_null() {
@@ -56,28 +60,33 @@ impl GgufContext {
     }
 
     /// Return the value type of the KV pair at `idx`.
+    #[must_use]
     pub fn kv_type(&self, idx: i64) -> llama_cpp_sys_2::gguf_type {
         unsafe { llama_cpp_sys_2::gguf_get_kv_type(self.ctx.as_ptr(), idx) }
     }
 
     /// Read a `uint32` value. Panics (inside llama.cpp) if the stored type is
     /// not `GGUF_TYPE_UINT32` — check `kv_type` first if unsure.
+    #[must_use]
     pub fn val_u32(&self, idx: i64) -> u32 {
         unsafe { llama_cpp_sys_2::gguf_get_val_u32(self.ctx.as_ptr(), idx) }
     }
 
     /// Read an `int32` value.
+    #[must_use]
     pub fn val_i32(&self, idx: i64) -> i32 {
         unsafe { llama_cpp_sys_2::gguf_get_val_i32(self.ctx.as_ptr(), idx) }
     }
 
     /// Read a `uint64` value.
+    #[must_use]
     pub fn val_u64(&self, idx: i64) -> u64 {
         unsafe { llama_cpp_sys_2::gguf_get_val_u64(self.ctx.as_ptr(), idx) }
     }
 
     /// Read a string value. Returns `None` if the pointer is null or not
     /// valid UTF-8.
+    #[must_use]
     pub fn val_str(&self, idx: i64) -> Option<&str> {
         let ptr = unsafe { llama_cpp_sys_2::gguf_get_val_str(self.ctx.as_ptr(), idx) };
         if ptr.is_null() {
@@ -87,6 +96,7 @@ impl GgufContext {
     }
 
     /// Total number of tensors described in the file.
+    #[must_use]
     pub fn n_tensors(&self) -> i64 {
         unsafe { llama_cpp_sys_2::gguf_get_n_tensors(self.ctx.as_ptr()) }
     }

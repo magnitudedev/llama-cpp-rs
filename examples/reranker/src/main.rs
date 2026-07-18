@@ -122,28 +122,7 @@ fn main() -> Result<()> {
         bail!("One of the provided prompts exceeds the size of the context window");
     }
 
-    // print the prompt token-by-token
-    eprintln!();
-
-    let mut decoder = encoding_rs::UTF_8.new_decoder();
-
-    for (i, token_line) in tokens_lines_list.iter().enumerate() {
-        eprintln!("Prompt {i} --> {}", prompt_lines[i]);
-        eprintln!("Number of tokens: {}", token_line.len());
-        for token in token_line {
-            // Attempt to convert token to string and print it; if it fails, print the token instead
-            match model.token_to_piece(*token, &mut decoder, true, None) {
-                Ok(token_str) => eprintln!("{token} --> {token_str}"),
-                Err(e) => {
-                    eprintln!("Failed to convert token to string, error: {e}");
-                    eprintln!("Token value: {token}");
-                }
-            }
-        }
-        eprintln!();
-    }
-
-    std::io::stderr().flush()?;
+    print_prompt_tokens(&model, &prompt_lines, &tokens_lines_list)?;
 
     // create a llama_batch with the size of the context
     // we use this object to submit token data for decoding
@@ -190,21 +169,7 @@ fn main() -> Result<()> {
 
     let t_main_end = ggml_time_us();
 
-    for (j, embeddings) in output.iter().enumerate() {
-        if pooling == "rank" {
-            eprintln!("rerank score {j}: {:8.3}", embeddings[0]);
-        } else {
-            eprintln!("embedding {j}: ");
-            for embedding in embeddings {
-                if normalise {
-                    eprint!("{embedding:9.6} ");
-                } else {
-                    eprint!("{embedding:6.5} ");
-                }
-            }
-            eprintln!();
-        }
-    }
+    print_embeddings(&output, &pooling, normalise);
 
     let duration = Duration::from_micros((t_main_end - t_main_start) as u64);
     let total_tokens: usize = tokens_lines_list.iter().map(Vec::len).sum();
@@ -217,6 +182,49 @@ fn main() -> Result<()> {
 
     println!("{}", ctx.timings());
 
+    Ok(())
+}
+
+fn print_embeddings(output: &[Vec<f32>], pooling: &str, normalise: bool) {
+    for (index, embeddings) in output.iter().enumerate() {
+        if pooling == "rank" {
+            eprintln!("rerank score {index}: {:8.3}", embeddings[0]);
+            continue;
+        }
+        eprintln!("embedding {index}: ");
+        for embedding in embeddings {
+            if normalise {
+                eprint!("{embedding:9.6} ");
+            } else {
+                eprint!("{embedding:6.5} ");
+            }
+        }
+        eprintln!();
+    }
+}
+
+fn print_prompt_tokens(
+    model: &LlamaModel,
+    prompt_lines: &[String],
+    token_lines: &[Vec<llama_cpp_2::token::LlamaToken>],
+) -> Result<()> {
+    eprintln!();
+    let mut decoder = encoding_rs::UTF_8.new_decoder();
+    for (index, tokens) in token_lines.iter().enumerate() {
+        eprintln!("Prompt {index} --> {}", prompt_lines[index]);
+        eprintln!("Number of tokens: {}", tokens.len());
+        for token in tokens {
+            match model.token_to_piece(*token, &mut decoder, true, None) {
+                Ok(token_str) => eprintln!("{token} --> {token_str}"),
+                Err(error) => {
+                    eprintln!("Failed to convert token to string, error: {error}");
+                    eprintln!("Token value: {token}");
+                }
+            }
+        }
+        eprintln!();
+    }
+    std::io::stderr().flush()?;
     Ok(())
 }
 

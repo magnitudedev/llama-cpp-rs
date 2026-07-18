@@ -29,12 +29,18 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
-      - name: Clippy
-        run: cargo clippy
+      - name: Lint extended llama.cpp bindings
+        run: >-
+          cargo clippy --workspace --all-targets --features sampler,mtmd -- -D warnings
       - name: Fmt
-        run: cargo fmt --check
-      - name: Test
-        run: cargo test --features sampler
+        run: cargo fmt --all -- --check
+      - name: Test bindings feature matrix
+        run: |
+          cargo test -p llama-cpp-2 --no-default-features
+          cargo test -p llama-cpp-2 --no-default-features --features common
+          cargo test -p llama-cpp-2 --no-default-features --features common,serde
+          cargo test -p llama-cpp-2 --no-default-features --features mtmd
+          cargo test -p llama-cpp-2 --no-default-features --features common,mtmd,sampler
       - name: Dry-Run Publishing
         run: RUST_BACKTRACE=1 cargo publish --workspace --verbose --dry-run
   arm64:
@@ -46,6 +52,8 @@ jobs:
     steps:
       - name: checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          submodules: recursive
       - name: Setup QEMU
         uses: docker/setup-qemu-action@06116385d9baf250c9f4dcb4858b16962ea869c3
         with:
