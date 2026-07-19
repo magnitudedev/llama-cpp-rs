@@ -124,6 +124,7 @@ typedef struct llama_rs_chat_prepare_options {
     bool parallel_tool_calls_set;
     bool parallel_tool_calls;
     enum llama_rs_chat_reasoning_format reasoning_format;
+    bool enable_thinking_set;
     bool enable_thinking;
     const struct llama_rs_chat_template_kwarg_input * template_kwargs;
     size_t template_kwargs_count;
@@ -193,6 +194,7 @@ llama_rs_status llama_rs_chat_templates_init(
     const char * template_override,
     const char * bos_token_override,
     const char * eos_token_override,
+    const char * tool_use_template_override,
     struct llama_rs_chat_templates ** out_templates,
     char ** out_error);
 

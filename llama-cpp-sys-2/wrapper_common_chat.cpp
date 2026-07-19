@@ -395,6 +395,7 @@ extern "C" llama_rs_status llama_rs_chat_templates_init(
     const char * template_override,
     const char * bos_token_override,
     const char * eos_token_override,
+    const char * tool_use_template_override,
     struct llama_rs_chat_templates ** out_templates,
     char ** out_error) {
     if (out_error) {
@@ -405,19 +406,13 @@ extern "C" llama_rs_status llama_rs_chat_templates_init(
             out_error, LLAMA_RS_STATUS_INVALID_ARGUMENT, "out_templates must not be null");
     }
     *out_templates = nullptr;
-    if (!model && (!template_override || template_override[0] == '\0')) {
-        return llama_rs_chat_set_error(
-            out_error,
-            LLAMA_RS_STATUS_INVALID_ARGUMENT,
-            "a model or non-empty template override is required");
-    }
-
     try {
         auto templates = common_chat_templates_init(
             model,
             llama_rs_chat_optional_string(template_override),
             llama_rs_chat_optional_string(bos_token_override),
-            llama_rs_chat_optional_string(eos_token_override));
+            llama_rs_chat_optional_string(eos_token_override),
+            llama_rs_chat_optional_string(tool_use_template_override));
         auto wrapper = std::make_unique<llama_rs_chat_templates>(std::move(templates));
         *out_templates = wrapper.release();
         return LLAMA_RS_STATUS_OK;
@@ -578,6 +573,7 @@ extern "C" llama_rs_status llama_rs_chat_templates_prepare(
             ? options->parallel_tool_calls
             : common_chat_templates_get_caps(templates->value.get()).at("supports_parallel_tool_calls");
         inputs.reasoning_format = llama_rs_chat_convert_reasoning_format(options->reasoning_format);
+        inputs.enable_thinking_set = options->enable_thinking_set;
         inputs.enable_thinking = options->enable_thinking;
         for (size_t i = 0; i < options->template_kwargs_count; ++i) {
             const auto & kwarg = options->template_kwargs[i];

@@ -301,8 +301,9 @@ pub struct ChatPrepareOptions {
     pub parallel_tool_calls: Option<bool>,
     /// Reasoning response format.
     pub reasoning_format: ChatReasoningFormat,
-    /// Allow the template to enable thinking.
-    pub enable_thinking: bool,
+    /// Explicitly control thinking. `None` omits the Jinja variable and preserves the template's
+    /// authored default.
+    pub enable_thinking: Option<bool>,
     /// Additional JSON-valued Jinja arguments.
     pub template_kwargs: Vec<ChatTemplateKwarg>,
     /// Render and parse all assistant output as plain content.
@@ -322,7 +323,7 @@ impl Default for ChatPrepareOptions {
             tool_choice: ChatToolChoice::Auto,
             parallel_tool_calls: None,
             reasoning_format: ChatReasoningFormat::DeepSeek,
-            enable_thinking: true,
+            enable_thinking: Some(true),
             template_kwargs: Vec::new(),
             force_pure_content: false,
         }
@@ -436,7 +437,7 @@ impl CommonChatTemplates {
         template_override: Option<&str>,
     ) -> Result<Self, CommonChatError> {
         let template = optional_c_string(template_override)?;
-        Self::init(model.model.as_ptr(), template.as_ref(), None, None)
+        Self::init(model.model.as_ptr(), template.as_ref(), None, None, None)
     }
 
     /// Compile an explicit template without loading a model.
@@ -454,7 +455,35 @@ impl CommonChatTemplates {
         let template = CString::new(template)?;
         let bos = optional_c_string(bos_token)?;
         let eos = optional_c_string(eos_token)?;
-        Self::init(ptr::null(), Some(&template), bos.as_ref(), eos.as_ref())
+        Self::init(
+            ptr::null(),
+            Some(&template),
+            bos.as_ref(),
+            eos.as_ref(),
+            None,
+        )
+    }
+
+    /// Reproduce model template selection from extracted GGUF metadata without loading weights.
+    /// Missing default metadata uses the pinned llama.cpp fallback; `tool_use` remains available
+    /// for the same named-template selection used by execution.
+    pub fn from_metadata(
+        default_template: Option<&str>,
+        tool_use_template: Option<&str>,
+        bos_token: Option<&str>,
+        eos_token: Option<&str>,
+    ) -> Result<Self, CommonChatError> {
+        let template = optional_c_string(default_template)?;
+        let tool_use = optional_c_string(tool_use_template)?;
+        let bos = optional_c_string(bos_token)?;
+        let eos = optional_c_string(eos_token)?;
+        Self::init(
+            ptr::null(),
+            template.as_ref(),
+            bos.as_ref(),
+            eos.as_ref(),
+            tool_use.as_ref(),
+        )
     }
 
     fn init(
@@ -462,6 +491,7 @@ impl CommonChatTemplates {
         template: Option<&CString>,
         bos: Option<&CString>,
         eos: Option<&CString>,
+        tool_use: Option<&CString>,
     ) -> Result<Self, CommonChatError> {
         let mut raw = ptr::null_mut();
         let mut error = ptr::null_mut();
@@ -471,6 +501,7 @@ impl CommonChatTemplates {
                 c_string_ptr(template),
                 c_string_ptr(bos),
                 c_string_ptr(eos),
+                c_string_ptr(tool_use),
                 &raw mut raw,
                 &raw mut error,
             )
@@ -1195,7 +1226,7 @@ struct EncodedPrepareOptions {
     tool_choice: ChatToolChoice,
     parallel_tool_calls: Option<bool>,
     reasoning_format: ChatReasoningFormat,
-    enable_thinking: bool,
+    enable_thinking: Option<bool>,
     force_pure_content: bool,
 }
 
@@ -1256,7 +1287,8 @@ impl EncodedPrepareOptions {
             parallel_tool_calls_set: self.parallel_tool_calls.is_some(),
             parallel_tool_calls: self.parallel_tool_calls.unwrap_or(false),
             reasoning_format: self.reasoning_format.raw(),
-            enable_thinking: self.enable_thinking,
+            enable_thinking_set: self.enable_thinking.is_some(),
+            enable_thinking: self.enable_thinking.unwrap_or(false),
             template_kwargs: slice_ptr(&self.raw_kwargs),
             template_kwargs_count: self.raw_kwargs.len(),
             force_pure_content: self.force_pure_content,
@@ -1688,6 +1720,38 @@ mod tests {
     // Keep this fixture in the safe crate so its published package tests do not
     // depend on a sibling sys-crate checkout being present.
     const QWEN3: &str = include_str!("../tests/fixtures/Qwen-Qwen3-0.6B.jinja");
+
+    const AUTHORED_DISABLED: &str = r"{% set enable_thinking = enable_thinking | default(false) %}{% if enable_thinking %}<think>{% endif %}assistant:";
+
+    #[test]
+    fn optional_enable_thinking_preserves_authored_default() {
+        let templates = CommonChatTemplates::from_template(AUTHORED_DISABLED, None, None).unwrap();
+        let render = |enable_thinking| {
+            templates
+                .prepare(&ChatPrepareOptions {
+                    enable_thinking,
+                    ..ChatPrepareOptions::default()
+                })
+                .unwrap()
+                .prompt()
+                .to_owned()
+        };
+        assert_eq!(render(None), "assistant:");
+        assert_eq!(render(Some(false)), "assistant:");
+        assert_eq!(render(Some(true)), "<think>assistant:");
+    }
+
+    #[test]
+    fn metadata_constructor_applies_fallback_and_named_tool_template() {
+        let fallback = CommonChatTemplates::from_metadata(None, None, None, None).unwrap();
+        assert!(!fallback.source(None).unwrap().is_empty());
+        assert!(!fallback.was_explicit());
+
+        let tool = "{% for message in messages %}tool:{{ message['content'] }}{% endfor %}";
+        let templates = CommonChatTemplates::from_metadata(None, Some(tool), None, None).unwrap();
+        assert_eq!(templates.source(Some("tool_use")).unwrap(), tool);
+        assert!(templates.was_explicit());
+    }
 
     #[test]
     fn template_override_prepares_and_parses_content() {
