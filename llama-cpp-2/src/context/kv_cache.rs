@@ -3,6 +3,50 @@
 use crate::context::LlamaContext;
 use std::ffi::c_int;
 use std::num::{NonZeroU8, TryFromIntError};
+use std::ptr::NonNull;
+
+/// A context-scoped immutable KV page retained by llama.cpp's unified cache.
+///
+/// The native identifier is intentionally private and carries its originating context pointer so
+/// safe callers cannot accidentally attach a target-context page to a draft context.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct LlamaKvPageId {
+    context: NonNull<llama_cpp_sys_2::llama_context>,
+    id: u64,
+}
+
+/// Current logical cell usage for the native page cache.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LlamaKvPageStats {
+    /// Number of retained page records.
+    pub pages: u32,
+    /// Cells owned by requests, page pins, or both.
+    pub used_cells: u32,
+    /// Cells immediately available to native decode.
+    pub free_cells: u32,
+    /// Unique cells retained by at least one page pin.
+    pub pinned_cells: u32,
+}
+
+/// Failure from a safe radix-page operation.
+#[derive(Debug, Eq, PartialEq, thiserror::Error)]
+pub enum KvPageError {
+    /// The active memory is not a unified, independently pageable attention cache.
+    #[error("the active model memory does not support immutable KV pages")]
+    Unsupported,
+    /// The requested page range is empty, inverted, or exceeds llama.cpp's position type.
+    #[error("invalid KV page position range")]
+    InvalidRange,
+    /// A page belongs to a different native context.
+    #[error("KV page belongs to a different context")]
+    WrongContext,
+    /// Native metadata did not contain one ordinary token cell for every requested position.
+    #[error("native memory rejected the KV page operation")]
+    NativeRejected,
+    /// Native tensor serialization or validation of an imported page failed.
+    #[error("native memory rejected the KV page blob")]
+    InvalidBlob,
+}
 
 /// Errors that can occur when attempting to prepare values for the kv cache
 #[derive(Debug, Eq, PartialEq, thiserror::Error)]
@@ -20,6 +64,144 @@ pub enum KvCacheConversionError {
 }
 
 impl LlamaContext<'_> {
+    fn page_memory(&self) -> llama_cpp_sys_2::llama_memory_t {
+        unsafe { llama_cpp_sys_2::llama_get_memory(self.context.as_ptr()) }
+    }
+
+    /// Whether this context supports immutable, composable KV pages.
+    ///
+    /// The first implementation deliberately requires unified ordinary-attention memory. Hybrid,
+    /// recurrent, multidimensional-position, and per-sequence-stream layouts return `false`.
+    #[must_use]
+    pub fn kv_pages_supported(&self) -> bool {
+        unsafe { llama_cpp_sys_2::llama_memory_page_supports(self.page_memory()) }
+    }
+
+    /// Retain the exact sequence positions `[start, end)` as an immutable native KV page.
+    pub fn pin_kv_page(
+        &mut self,
+        sequence_id: i32,
+        start: u32,
+        end: u32,
+    ) -> Result<LlamaKvPageId, KvPageError> {
+        if !self.kv_pages_supported() {
+            return Err(KvPageError::Unsupported);
+        }
+        let start = i32::try_from(start).map_err(|_| KvPageError::InvalidRange)?;
+        let end = i32::try_from(end).map_err(|_| KvPageError::InvalidRange)?;
+        if end <= start {
+            return Err(KvPageError::InvalidRange);
+        }
+        let id = unsafe {
+            llama_cpp_sys_2::llama_memory_page_pin(self.page_memory(), sequence_id, start, end)
+        };
+        if id == 0 {
+            return Err(KvPageError::NativeRejected);
+        }
+        Ok(LlamaKvPageId {
+            context: self.context,
+            id,
+        })
+    }
+
+    /// Attach a retained page to a cleared destination sequence without copying its K/V data.
+    pub fn attach_kv_page(
+        &mut self,
+        page: LlamaKvPageId,
+        destination_sequence_id: i32,
+    ) -> Result<(), KvPageError> {
+        if page.context != self.context {
+            return Err(KvPageError::WrongContext);
+        }
+        let attached = unsafe {
+            llama_cpp_sys_2::llama_memory_page_attach(
+                self.page_memory(),
+                page.id,
+                destination_sequence_id,
+            )
+        };
+        attached.then_some(()).ok_or(KvPageError::NativeRejected)
+    }
+
+    /// Release one cache pin. Request sequences already attached to the page remain valid.
+    pub fn release_kv_page(&mut self, page: LlamaKvPageId) -> Result<(), KvPageError> {
+        if page.context != self.context {
+            return Err(KvPageError::WrongContext);
+        }
+        let released =
+            unsafe { llama_cpp_sys_2::llama_memory_page_release(self.page_memory(), page.id) };
+        released.then_some(()).ok_or(KvPageError::NativeRejected)
+    }
+
+    /// Copy one retained page into a self-describing opaque host blob.
+    pub fn export_kv_page(&self, page: LlamaKvPageId) -> Result<Vec<u8>, KvPageError> {
+        if page.context != self.context {
+            return Err(KvPageError::WrongContext);
+        }
+        let memory = self.page_memory();
+        let size = unsafe {
+            llama_cpp_sys_2::llama_memory_page_export(memory, page.id, std::ptr::null_mut(), 0)
+        };
+        if size == 0 {
+            return Err(KvPageError::InvalidBlob);
+        }
+        let mut blob = vec![0_u8; size];
+        let written = unsafe {
+            llama_cpp_sys_2::llama_memory_page_export(
+                memory,
+                page.id,
+                blob.as_mut_ptr().cast(),
+                blob.len(),
+            )
+        };
+        if written != size {
+            return Err(KvPageError::InvalidBlob);
+        }
+        Ok(blob)
+    }
+
+    /// Restore an exported page into free native cells and retain it with a new context-scoped ID.
+    pub fn import_kv_page(&mut self, blob: &[u8]) -> Result<LlamaKvPageId, KvPageError> {
+        if !self.kv_pages_supported() || blob.is_empty() {
+            return Err(KvPageError::InvalidBlob);
+        }
+        let id = unsafe {
+            llama_cpp_sys_2::llama_memory_page_import(
+                self.page_memory(),
+                blob.as_ptr().cast(),
+                blob.len(),
+            )
+        };
+        if id == 0 {
+            return Err(KvPageError::InvalidBlob);
+        }
+        Ok(LlamaKvPageId {
+            context: self.context,
+            id,
+        })
+    }
+
+    /// Number of token cells retained by one page, or zero if it is stale.
+    #[must_use]
+    pub fn kv_page_token_count(&self, page: LlamaKvPageId) -> u32 {
+        if page.context != self.context {
+            return 0;
+        }
+        unsafe { llama_cpp_sys_2::llama_memory_page_token_count(self.page_memory(), page.id) }
+    }
+
+    /// Return exact native page/cell accounting.
+    #[must_use]
+    pub fn kv_page_stats(&self) -> LlamaKvPageStats {
+        let memory = self.page_memory();
+        LlamaKvPageStats {
+            pages: unsafe { llama_cpp_sys_2::llama_memory_page_count(memory) },
+            used_cells: unsafe { llama_cpp_sys_2::llama_memory_page_used_cells(memory) },
+            free_cells: unsafe { llama_cpp_sys_2::llama_memory_page_free_cells(memory) },
+            pinned_cells: unsafe { llama_cpp_sys_2::llama_memory_page_pinned_cells(memory) },
+        }
+    }
+
     /// Whether this model's active memory implementation supports sequence position shifting.
     #[must_use]
     pub fn memory_can_shift(&self) -> bool {
