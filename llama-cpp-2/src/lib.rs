@@ -39,14 +39,16 @@ mod log;
 pub mod model;
 #[cfg(feature = "mtmd")]
 pub mod mtmd;
+#[cfg(feature = "common")]
+pub mod mtp;
 pub mod sampling;
 #[cfg(feature = "common")]
-pub mod speculative;
+mod speculative;
 pub mod timing;
 pub mod token;
 pub mod token_type;
 
-pub use crate::context::session::LlamaStateSeqFlags;
+pub use crate::context::session::{LlamaSequenceState, LlamaStateSeqFlags};
 
 #[cfg(feature = "common")]
 pub(crate) fn status_is_ok(status: llama_cpp_sys_2::llama_rs_status) -> bool {

@@ -413,6 +413,7 @@ impl LlamaModelParams {
         n_ctx_min: u32,
         log_level: llama_cpp_sys_2::ggml_log_level,
     ) -> Result<FitResult, FitError> {
+        let _logger_guard = crate::log::lock_native_logger();
         let max_devices = unsafe { llama_cpp_sys_2::llama_max_devices() };
         if margins.len() < max_devices {
             return Err(FitError::InvalidMargins {

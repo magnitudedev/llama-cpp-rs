@@ -577,6 +577,8 @@ fn main() {
         "wrapper_common_fit.cpp",
         "wrapper_common_misc.h",
         "wrapper_common_misc.cpp",
+        "wrapper_common_mtp.h",
+        "wrapper_common_mtp.cpp",
     ] {
         println!("cargo:rerun-if-changed={common_wrapper}");
     }
@@ -615,6 +617,7 @@ fn main() {
                 "wrapper_common_sampling.cpp",
                 "wrapper_common_fit.cpp",
                 "wrapper_common_misc.cpp",
+                "wrapper_common_mtp.cpp",
             ])
             .include(&llama_src)
             .include(llama_src.join("common"))

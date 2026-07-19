@@ -366,6 +366,17 @@ impl FitReport {
 
 struct NativeFitReport(NonNull<sys::llama_rs_fit_report>);
 
+/// A no-allocation target model/context kept alive while fitting a linked MTP context.
+#[derive(Debug)]
+pub struct LinkedFitTarget<'a> {
+    /// Exact target GGUF.
+    pub model_path: &'a CStr,
+    /// Exact target model loading parameters.
+    pub model_params: &'a LlamaModelParams,
+    /// Exact target context parameters.
+    pub context_params: &'a LlamaContextParams,
+}
+
 impl Drop for NativeFitReport {
     fn drop(&mut self) {
         unsafe { sys::llama_rs_fit_report_free(self.0.as_ptr()) };
@@ -394,12 +405,39 @@ impl LlamaModelParams {
     /// Returns [`FitReportError`] for invalid buffers, bridge failures, or a
     /// malformed result. Native fit failures are represented in the report.
     pub fn fit_params_report(
-        mut self: Pin<&mut Self>,
+        self: Pin<&mut Self>,
         model_path: &CStr,
         cparams: &mut LlamaContextParams,
         margins: &mut [usize],
         n_ctx_min: u32,
     ) -> Result<FitReport, FitReportError> {
+        self.fit_params_report_impl(model_path, cparams, None, margins, n_ctx_min)
+    }
+
+    /// Fit an MTP model/context while a no-allocation target context is linked as `ctx_other`.
+    ///
+    /// The returned report contains only the fitted model/context allocations. Compose it with a
+    /// separate target report to assess the full execution plan.
+    pub fn fit_params_report_linked(
+        self: Pin<&mut Self>,
+        model_path: &CStr,
+        cparams: &mut LlamaContextParams,
+        target: LinkedFitTarget<'_>,
+        margins: &mut [usize],
+        n_ctx_min: u32,
+    ) -> Result<FitReport, FitReportError> {
+        self.fit_params_report_impl(model_path, cparams, Some(target), margins, n_ctx_min)
+    }
+
+    fn fit_params_report_impl(
+        mut self: Pin<&mut Self>,
+        model_path: &CStr,
+        cparams: &mut LlamaContextParams,
+        linked_target: Option<LinkedFitTarget<'_>>,
+        margins: &mut [usize],
+        n_ctx_min: u32,
+    ) -> Result<FitReport, FitReportError> {
+        let _logger_guard = crate::log::lock_native_logger();
         let max_devices = unsafe { sys::llama_max_devices() };
         if margins.len() < max_devices {
             return Err(FitReportError::InvalidMargins {
@@ -409,8 +447,12 @@ impl LlamaModelParams {
         }
         let max_overrides = unsafe { sys::llama_max_tensor_buft_overrides() };
 
-        self.tensor_split.clear();
-        self.tensor_split.resize(max_devices, 0.0);
+        // Keep an explicitly configured tensor split attached to `mparams` so
+        // the initial measurement describes the plan the caller actually
+        // requested. `common_fit_params` still requires a separate output
+        // buffer for an automatically selected split.
+        let original_tensor_split = self.params.tensor_split;
+        let mut fitted_tensor_split = vec![0.0; max_devices];
         self.buft_overrides.clear();
         self.buft_overrides.resize(
             max_overrides + 1,
@@ -419,30 +461,47 @@ impl LlamaModelParams {
                 buft: ptr::null_mut(),
             },
         );
-        self.params.tensor_split = ptr::null();
         self.params.tensor_buft_overrides = ptr::null();
 
         let mut native_report = ptr::null_mut();
         let mut native_error: *mut c_char = ptr::null_mut();
         let status = unsafe {
-            sys::llama_rs_fit_report_create(
-                model_path.as_ptr(),
-                &raw mut self.params,
-                &raw mut cparams.context_params,
-                self.tensor_split.as_mut_ptr(),
-                self.buft_overrides.as_mut_ptr(),
-                margins.as_mut_ptr(),
-                margins.len(),
-                n_ctx_min,
-                sys::GGML_LOG_LEVEL_ERROR,
-                &raw mut native_report,
-                &raw mut native_error,
-            )
+            match linked_target {
+                Some(target) => sys::llama_rs_fit_report_create_linked(
+                    model_path.as_ptr(),
+                    &raw mut self.params,
+                    &raw mut cparams.context_params,
+                    target.model_path.as_ptr(),
+                    &raw const target.model_params.params,
+                    &raw const target.context_params.context_params,
+                    fitted_tensor_split.as_mut_ptr(),
+                    self.buft_overrides.as_mut_ptr(),
+                    margins.as_mut_ptr(),
+                    margins.len(),
+                    n_ctx_min,
+                    sys::GGML_LOG_LEVEL_ERROR,
+                    &raw mut native_report,
+                    &raw mut native_error,
+                ),
+                None => sys::llama_rs_fit_report_create(
+                    model_path.as_ptr(),
+                    &raw mut self.params,
+                    &raw mut cparams.context_params,
+                    fitted_tensor_split.as_mut_ptr(),
+                    self.buft_overrides.as_mut_ptr(),
+                    margins.as_mut_ptr(),
+                    margins.len(),
+                    n_ctx_min,
+                    sys::GGML_LOG_LEVEL_ERROR,
+                    &raw mut native_report,
+                    &raw mut native_error,
+                ),
+            }
         };
 
         // common/fit may point the raw params at these buffers even on a failed
         // fit attempt, so always restore their stable, owned addresses.
-        self.params.tensor_split = self.tensor_split.as_ptr();
+        self.params.tensor_split = original_tensor_split;
         self.params.tensor_buft_overrides = self.buft_overrides.as_ptr();
 
         if status != sys::LLAMA_RS_STATUS_OK {

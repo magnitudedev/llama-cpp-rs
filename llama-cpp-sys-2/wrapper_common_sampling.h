@@ -173,6 +173,19 @@ llama_rs_status llama_rs_common_sampler_sample(
     llama_token * out_token,
     char ** out_error);
 
+llama_rs_status llama_rs_common_sampler_sample_and_accept_n(
+    struct llama_rs_common_sampler * sampler,
+    struct llama_context * context,
+    const int32_t * indices,
+    size_t indices_count,
+    const llama_token * draft,
+    size_t draft_count,
+    bool grammar_first,
+    llama_token * out_tokens,
+    size_t out_tokens_capacity,
+    size_t * out_tokens_count,
+    char ** out_error);
+
 llama_rs_status llama_rs_common_sampler_reset(
     struct llama_rs_common_sampler * sampler,
     char ** out_error);

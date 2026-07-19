@@ -883,6 +883,26 @@ impl LlamaModel {
         Ok(LlamaContext::new(self, context, params.embeddings()))
     }
 
+    /// Create an MTP context linked to an existing target context.
+    ///
+    /// The returned context cannot outlive either the model or target context.
+    #[allow(clippy::needless_pass_by_value)]
+    pub(crate) fn new_mtp_context_linked<'a>(
+        &'a self,
+        _: &LlamaBackend,
+        mut params: LlamaContextParams,
+        target: &LlamaContext<'_>,
+    ) -> Result<LlamaContext<'a>, LlamaContextLoadError> {
+        params.context_params.ctx_type = llama_cpp_sys_2::LLAMA_CONTEXT_TYPE_MTP;
+        params.context_params.ctx_other = target.context.as_ptr();
+        let context_params = params.context_params;
+        let context = unsafe {
+            llama_cpp_sys_2::llama_new_context_with_model(self.model.as_ptr(), context_params)
+        };
+        let context = NonNull::new(context).ok_or(LlamaContextLoadError::NullReturn)?;
+        Ok(LlamaContext::new(self, context, params.embeddings()))
+    }
+
     /// Apply the models chat template to some messages.
     /// See <https://github.com/ggerganov/llama.cpp/wiki/Templates-supported-by-llama_chat_apply_template>
     ///

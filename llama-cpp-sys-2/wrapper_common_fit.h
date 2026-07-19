@@ -112,6 +112,25 @@ llama_rs_status llama_rs_fit_report_create(
     struct llama_rs_fit_report ** out_report,
     char ** out_error);
 
+// Runs the same fit path while keeping a no-allocation target context alive as `ctx_other`.
+// This is required for MTP graph planning and does not include the target allocations in the
+// returned linked-model report; callers compose the separately measured target report.
+llama_rs_status llama_rs_fit_report_create_linked(
+    const char * path_model,
+    struct llama_model_params * mparams,
+    struct llama_context_params * cparams,
+    const char * target_path,
+    const struct llama_model_params * target_mparams,
+    const struct llama_context_params * target_cparams,
+    float * tensor_split,
+    struct llama_model_tensor_buft_override * tensor_buft_overrides,
+    size_t * margins,
+    size_t margins_count,
+    uint32_t n_ctx_min,
+    enum ggml_log_level log_level,
+    struct llama_rs_fit_report ** out_report,
+    char ** out_error);
+
 void llama_rs_fit_report_free(struct llama_rs_fit_report * report);
 
 bool llama_rs_fit_report_get_summary(

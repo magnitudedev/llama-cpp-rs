@@ -431,6 +431,54 @@ impl<'model> CommonSampler<'model> {
         Ok(LlamaToken(token))
     }
 
+    /// Verify a speculative draft against multiple outputs from the latest
+    /// target decode and advance sampler state through the accepted result.
+    ///
+    /// `indices` must contain one output index for the sampled continuation
+    /// plus one for every draft token. The returned vector therefore always
+    /// has at least one token on success.
+    pub fn sample_and_accept_n(
+        &mut self,
+        context: &LlamaContext<'model>,
+        indices: &[i32],
+        draft: &[LlamaToken],
+        grammar_first: bool,
+    ) -> Result<Vec<LlamaToken>, CommonSamplerError> {
+        if !std::ptr::eq(self.model, context.model) {
+            return Err(CommonSamplerError::MismatchedModel);
+        }
+        if indices.len() != draft.len() + 1 {
+            return Err(CommonSamplerError::LogitsUnavailable { index: -1 });
+        }
+        for &index in indices {
+            if !context.has_initialized_logits(index) {
+                return Err(CommonSamplerError::LogitsUnavailable { index });
+            }
+        }
+        let raw_draft = draft.iter().map(|token| token.0).collect::<Vec<_>>();
+        let mut output = vec![NULL_TOKEN; indices.len()];
+        let mut output_len = 0_usize;
+        let mut error = ptr::null_mut();
+        let status = unsafe {
+            sys::llama_rs_common_sampler_sample_and_accept_n(
+                self.raw.as_ptr(),
+                context.context.as_ptr(),
+                indices.as_ptr(),
+                indices.len(),
+                raw_draft.as_ptr(),
+                raw_draft.len(),
+                grammar_first,
+                output.as_mut_ptr(),
+                output.len(),
+                &raw mut output_len,
+                &raw mut error,
+            )
+        };
+        check_status(status, error)?;
+        output.truncate(output_len);
+        Ok(output.into_iter().map(LlamaToken).collect())
+    }
+
     /// Reset upstream primitive-sampler and accepted-token history.
     ///
     /// The pinned llama.cpp `common_sampler_reset` does not fully rewind its

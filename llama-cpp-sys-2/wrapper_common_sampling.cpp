@@ -482,6 +482,59 @@ extern "C" llama_rs_status llama_rs_common_sampler_sample(
     }
 }
 
+extern "C" llama_rs_status llama_rs_common_sampler_sample_and_accept_n(
+    struct llama_rs_common_sampler * sampler,
+    struct llama_context * context,
+    const int32_t * indices,
+    size_t indices_count,
+    const llama_token * draft,
+    size_t draft_count,
+    bool grammar_first,
+    llama_token * out_tokens,
+    size_t out_tokens_capacity,
+    size_t * out_tokens_count,
+    char ** out_error) {
+    if (out_error) {
+        *out_error = nullptr;
+    }
+    if (!sampler || !sampler->value || !context || !indices ||
+        indices_count != draft_count + 1 || (!draft && draft_count > 0) ||
+        !out_tokens_count || out_tokens_capacity < indices_count || !out_tokens) {
+        return llama_rs_chat_set_error(
+            out_error,
+            LLAMA_RS_STATUS_INVALID_ARGUMENT,
+            "invalid speculative sampler arguments");
+    }
+    try {
+        const std::vector<int32_t> index_values(indices, indices + indices_count);
+        llama_tokens draft_values;
+        if (draft_count > 0) {
+            draft_values.assign(draft, draft + draft_count);
+        }
+        const auto accepted = common_sampler_sample_and_accept_n(
+            sampler->value,
+            context,
+            index_values,
+            draft_values,
+            grammar_first);
+        *out_tokens_count = accepted.size();
+        if (accepted.size() > out_tokens_capacity) {
+            return llama_rs_chat_set_error(
+                out_error,
+                LLAMA_RS_STATUS_ALLOCATION_FAILED,
+                "accepted speculative output exceeded capacity");
+        }
+        std::copy(accepted.begin(), accepted.end(), out_tokens);
+        if (!accepted.empty()) {
+            sampler->last = accepted.back();
+            sampler->has_last = true;
+        }
+        return LLAMA_RS_STATUS_OK;
+    } catch (...) {
+        return llama_rs_chat_current_exception(out_error);
+    }
+}
+
 extern "C" llama_rs_status llama_rs_common_sampler_reset(
     struct llama_rs_common_sampler * sampler,
     char ** out_error) {

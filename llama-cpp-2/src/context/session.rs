@@ -12,6 +12,36 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LlamaStateSeqFlags(pub(crate) llama_cpp_sys_2::llama_state_seq_flags);
 
+/// An owned sequence-state snapshot produced by llama.cpp.
+///
+/// The bytes are deliberately opaque: callers can retain and restore a snapshot, but cannot
+/// manufacture a value that violates llama.cpp's state-data format.
+#[derive(Clone, Debug)]
+pub struct LlamaSequenceState {
+    data: Vec<u8>,
+    flags: LlamaStateSeqFlags,
+}
+
+impl LlamaSequenceState {
+    /// Number of bytes in the native snapshot.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.data.len()
+    }
+
+    /// Whether the native snapshot contains no data.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.data.is_empty()
+    }
+
+    /// Flags with which this snapshot was captured and must be restored.
+    #[must_use]
+    pub fn flags(&self) -> LlamaStateSeqFlags {
+        self.flags
+    }
+}
+
 impl LlamaStateSeqFlags {
     /// Work only with partial states, such as SWA KV cache or recurrent cache (e.g. Mamba).
     ///
@@ -549,6 +579,35 @@ impl LlamaContext<'_> {
         }
         data.truncate(copied);
         Ok(data)
+    }
+
+    /// Capture an opaque, owned snapshot of one sequence.
+    ///
+    /// Unlike the lower-level byte-buffer methods, this produces the only public value accepted by
+    /// [`Self::restore_sequence_state`], keeping validity of native state bytes inside this crate.
+    pub fn capture_sequence_state(
+        &self,
+        seq_id: i32,
+        flags: LlamaStateSeqFlags,
+    ) -> Result<LlamaSequenceState, GetSeqStateDataError> {
+        self.state_seq_get_data_ext_owned(seq_id, flags)
+            .map(|data| LlamaSequenceState { data, flags })
+    }
+
+    /// Restore a sequence snapshot previously captured by [`Self::capture_sequence_state`].
+    ///
+    /// Returns `false` when llama.cpp rejects the snapshot for this context or destination
+    /// sequence. No native state-format invariant is delegated to the caller.
+    pub fn restore_sequence_state(&mut self, state: &LlamaSequenceState, dest_seq_id: i32) -> bool {
+        unsafe {
+            llama_cpp_sys_2::llama_state_seq_set_data_ext(
+                self.context.as_ptr(),
+                state.data.as_ptr(),
+                state.data.len(),
+                dest_seq_id,
+                state.flags.0,
+            ) > 0
+        }
     }
 
     /// Copy the extended state of a single sequence into a caller-allocated buffer.

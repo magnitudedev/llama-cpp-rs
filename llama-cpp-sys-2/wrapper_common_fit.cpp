@@ -108,6 +108,21 @@ struct llama_rs_context_memory_report {
     std::vector<llama_rs_buffer_type_memory_storage> other_buffer_types;
 };
 
+struct llama_rs_context_other_guard {
+    llama_context_params * params;
+    llama_context * original;
+
+    llama_rs_context_other_guard(llama_context_params * params, llama_context * original) :
+        params(params), original(original) {}
+
+    llama_rs_context_other_guard(const llama_rs_context_other_guard &) = delete;
+    llama_rs_context_other_guard & operator=(const llama_rs_context_other_guard &) = delete;
+
+    ~llama_rs_context_other_guard() {
+        params->ctx_other = original;
+    }
+};
+
 static struct llama_rs_bytes_view llama_rs_context_memory_view(const std::string & value) {
     return {
         reinterpret_cast<const uint8_t *>(value.data()),
@@ -513,10 +528,13 @@ static void llama_rs_fit_capture_placement(
     report.placements.push_back(std::move(output));
 }
 
-extern "C" llama_rs_status llama_rs_fit_report_create(
+static llama_rs_status llama_rs_fit_report_create_impl(
     const char * path_model,
     struct llama_model_params * mparams,
     struct llama_context_params * cparams,
+    const char * target_path,
+    const struct llama_model_params * target_mparams,
+    const struct llama_context_params * target_cparams,
     float * tensor_split,
     struct llama_model_tensor_buft_override * tensor_buft_overrides,
     size_t * margins,
@@ -538,6 +556,13 @@ extern "C" llama_rs_status llama_rs_fit_report_create(
             LLAMA_RS_STATUS_INVALID_ARGUMENT,
             "fit report arguments must not be null");
     }
+    const bool has_linked_target = target_path || target_mparams || target_cparams;
+    if (has_linked_target && (!target_path || !target_mparams || !target_cparams)) {
+        return llama_rs_chat_set_error(
+            out_error,
+            LLAMA_RS_STATUS_INVALID_ARGUMENT,
+            "linked fit target arguments must be supplied together");
+    }
     if (margins_count < llama_max_devices()) {
         return llama_rs_chat_set_error(
             out_error,
@@ -546,6 +571,30 @@ extern "C" llama_rs_status llama_rs_fit_report_create(
     }
 
     try {
+        std::unique_ptr<llama_model, decltype(&llama_model_free)> linked_model(nullptr, llama_model_free);
+        std::unique_ptr<llama_context, decltype(&llama_free)> linked_context(nullptr, llama_free);
+        std::unique_ptr<llama_rs_context_other_guard> context_guard;
+        if (has_linked_target) {
+            llama_model_params linked_mparams = *target_mparams;
+            linked_mparams.no_alloc = true;
+            linked_mparams.use_mmap = false;
+            linked_mparams.use_mlock = false;
+            linked_model.reset(llama_model_load_from_file(target_path, linked_mparams));
+            if (!linked_model) {
+                throw std::runtime_error("failed to inspect linked fit target model");
+            }
+            llama_context_params linked_cparams = *target_cparams;
+            linked_cparams.ctx_type = LLAMA_CONTEXT_TYPE_DEFAULT;
+            linked_cparams.ctx_other = nullptr;
+            linked_context.reset(llama_init_from_model(linked_model.get(), linked_cparams));
+            if (!linked_context) {
+                throw std::runtime_error("failed to construct linked fit target context");
+            }
+            context_guard = std::make_unique<llama_rs_context_other_guard>(
+                cparams, cparams->ctx_other);
+            cparams->ctx_other = linked_context.get();
+        }
+
         const int64_t started_at = llama_time_us();
         auto report = std::make_unique<llama_rs_fit_report>();
         const uint32_t requested_context_tokens = cparams->n_ctx;
@@ -594,7 +643,15 @@ extern "C" llama_rs_status llama_rs_fit_report_create(
         report->summary.fitted_measurement_available = fitted.available;
         report->summary.elapsed_microseconds = llama_time_us() - started_at;
 
-        report->tensor_split.assign(tensor_split, tensor_split + accelerator_count);
+        // For an explicit caller split common_fit_params leaves mparams intact;
+        // for an automatic split it points mparams at the supplied output
+        // buffer. Report the effective values in either case.
+        const float * effective_tensor_split = mparams->tensor_split
+            ? mparams->tensor_split
+            : tensor_split;
+        report->tensor_split.assign(
+            effective_tensor_split,
+            effective_tensor_split + accelerator_count);
         const size_t max_overrides = llama_max_tensor_buft_overrides();
         for (size_t index = 0;
              index < max_overrides && tensor_buft_overrides[index].pattern;
@@ -607,6 +664,47 @@ extern "C" llama_rs_status llama_rs_fit_report_create(
     } catch (...) {
         return llama_rs_chat_current_exception(out_error);
     }
+}
+
+extern "C" llama_rs_status llama_rs_fit_report_create(
+    const char * path_model,
+    struct llama_model_params * mparams,
+    struct llama_context_params * cparams,
+    float * tensor_split,
+    struct llama_model_tensor_buft_override * tensor_buft_overrides,
+    size_t * margins,
+    size_t margins_count,
+    uint32_t n_ctx_min,
+    enum ggml_log_level log_level,
+    struct llama_rs_fit_report ** out_report,
+    char ** out_error) {
+    return llama_rs_fit_report_create_impl(
+        path_model, mparams, cparams,
+        nullptr, nullptr, nullptr,
+        tensor_split, tensor_buft_overrides, margins, margins_count,
+        n_ctx_min, log_level, out_report, out_error);
+}
+
+extern "C" llama_rs_status llama_rs_fit_report_create_linked(
+    const char * path_model,
+    struct llama_model_params * mparams,
+    struct llama_context_params * cparams,
+    const char * target_path,
+    const struct llama_model_params * target_mparams,
+    const struct llama_context_params * target_cparams,
+    float * tensor_split,
+    struct llama_model_tensor_buft_override * tensor_buft_overrides,
+    size_t * margins,
+    size_t margins_count,
+    uint32_t n_ctx_min,
+    enum ggml_log_level log_level,
+    struct llama_rs_fit_report ** out_report,
+    char ** out_error) {
+    return llama_rs_fit_report_create_impl(
+        path_model, mparams, cparams,
+        target_path, target_mparams, target_cparams,
+        tensor_split, tensor_buft_overrides, margins, margins_count,
+        n_ctx_min, log_level, out_report, out_error);
 }
 
 extern "C" void llama_rs_fit_report_free(struct llama_rs_fit_report * report) {
