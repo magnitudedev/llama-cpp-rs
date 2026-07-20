@@ -169,6 +169,28 @@ pub struct FitDeviceEstimate {
     pub margin_bytes: Option<u64>,
 }
 
+impl FitDeviceEstimate {
+    /// Typed backend device class corresponding to [`Self::backend_type`].
+    #[must_use]
+    pub fn backend_device_type(&self) -> crate::LlamaBackendDeviceType {
+        match self.backend_type {
+            value if value == sys::GGML_BACKEND_DEVICE_TYPE_CPU as i32 => {
+                crate::LlamaBackendDeviceType::Cpu
+            }
+            value if value == sys::GGML_BACKEND_DEVICE_TYPE_ACCEL as i32 => {
+                crate::LlamaBackendDeviceType::Accelerator
+            }
+            value if value == sys::GGML_BACKEND_DEVICE_TYPE_GPU as i32 => {
+                crate::LlamaBackendDeviceType::Gpu
+            }
+            value if value == sys::GGML_BACKEND_DEVICE_TYPE_IGPU as i32 => {
+                crate::LlamaBackendDeviceType::IntegratedGpu
+            }
+            _ => crate::LlamaBackendDeviceType::Unknown,
+        }
+    }
+}
+
 /// Target selected by a tensor buffer override.
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize))]
