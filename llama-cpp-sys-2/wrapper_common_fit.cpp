@@ -34,6 +34,8 @@ static_assert(
     static_cast<int>(COMMON_PARAMS_FIT_STATUS_ERROR));
 
 static std::string llama_rs_fit_string(const char * value);
+static std::string llama_rs_fit_backend_name(ggml_backend_dev_t device);
+static std::string llama_rs_fit_device_id(ggml_backend_dev_t device);
 
 extern "C" int32_t llama_rs_common_default_math_threads(void) {
     return common_cpu_get_num_math();
@@ -43,6 +45,8 @@ struct llama_rs_fit_measurement_device {
     enum llama_rs_fit_device_kind kind = LLAMA_RS_FIT_DEVICE_ACCELERATOR;
     ggml_backend_dev_t device = nullptr;
     int32_t backend_type = 0;
+    std::string backend;
+    std::string device_id;
     std::string name;
     std::string description;
     struct llama_rs_fit_memory memory = {};
@@ -80,6 +84,8 @@ static struct llama_rs_fit_measurement llama_rs_fit_measure_loaded(
         value.kind = LLAMA_RS_FIT_DEVICE_ACCELERATOR;
         value.device = device;
         value.backend_type = static_cast<int32_t>(ggml_backend_dev_type(device));
+        value.backend = llama_rs_fit_backend_name(device);
+        value.device_id = llama_rs_fit_device_id(device);
         value.name = llama_rs_fit_string(ggml_backend_dev_name(device));
         value.description = llama_rs_fit_string(ggml_backend_dev_description(device));
         size_t free_bytes = 0;
@@ -95,6 +101,8 @@ static struct llama_rs_fit_measurement llama_rs_fit_measure_loaded(
     const auto cpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
     host.device = cpu;
     host.backend_type = static_cast<int32_t>(GGML_BACKEND_DEVICE_TYPE_CPU);
+    host.backend = llama_rs_fit_backend_name(cpu);
+    host.device_id = llama_rs_fit_device_id(cpu);
     host.name = cpu ? llama_rs_fit_string(ggml_backend_dev_name(cpu)) : "CPU";
     host.description = cpu ? llama_rs_fit_string(ggml_backend_dev_description(cpu)) : "Host memory";
     if (!cpu) {
@@ -137,6 +145,8 @@ struct llama_rs_fit_device_storage {
     enum llama_rs_fit_device_kind kind = LLAMA_RS_FIT_DEVICE_ACCELERATOR;
     ggml_backend_dev_t device = nullptr;
     int32_t backend_type = 0;
+    std::string backend;
+    std::string device_id;
     std::string name;
     std::string description;
     bool initial_available = false;
@@ -184,6 +194,23 @@ static std::string llama_rs_fit_string(const char * value) {
     return value ? value : "";
 }
 
+static std::string llama_rs_fit_backend_name(ggml_backend_dev_t device) {
+    if (!device) {
+        return "";
+    }
+    const auto registration = ggml_backend_dev_backend_reg(device);
+    return registration ? llama_rs_fit_string(ggml_backend_reg_name(registration)) : "";
+}
+
+static std::string llama_rs_fit_device_id(ggml_backend_dev_t device) {
+    if (!device) {
+        return "";
+    }
+    struct ggml_backend_dev_props properties = {};
+    ggml_backend_dev_get_props(device, &properties);
+    return llama_rs_fit_string(properties.device_id);
+}
+
 static struct llama_rs_fit_measurement llama_rs_fit_measure(
     const char * path_model,
     const struct llama_model_params * mparams,
@@ -215,6 +242,8 @@ static struct llama_rs_fit_measurement llama_rs_fit_measure(
             value.kind = LLAMA_RS_FIT_DEVICE_ACCELERATOR;
             value.device = device;
             value.backend_type = static_cast<int32_t>(ggml_backend_dev_type(device));
+            value.backend = llama_rs_fit_backend_name(device);
+            value.device_id = llama_rs_fit_device_id(device);
             value.name = llama_rs_fit_string(ggml_backend_dev_name(device));
             value.description = llama_rs_fit_string(ggml_backend_dev_description(device));
             value.memory.total_bytes = memory[index].total;
@@ -231,6 +260,8 @@ static struct llama_rs_fit_measurement llama_rs_fit_measure(
         const auto cpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
         host.device = cpu;
         host.backend_type = static_cast<int32_t>(GGML_BACKEND_DEVICE_TYPE_CPU);
+        host.backend = llama_rs_fit_backend_name(cpu);
+        host.device_id = llama_rs_fit_device_id(cpu);
         host.name = cpu ? llama_rs_fit_string(ggml_backend_dev_name(cpu)) : "CPU";
         host.description = cpu
             ? llama_rs_fit_string(ggml_backend_dev_description(cpu))
@@ -331,6 +362,7 @@ static void llama_rs_fit_merge_devices(
         host.name = "CPU";
         host.description = "Host memory";
         host.backend_type = static_cast<int32_t>(GGML_BACKEND_DEVICE_TYPE_CPU);
+        host.backend = "CPU";
     }
     identities.push_back(std::move(host));
 
@@ -342,6 +374,8 @@ static void llama_rs_fit_merge_devices(
         output.kind = identity.kind;
         output.device = identity.device;
         output.backend_type = identity.backend_type;
+        output.backend = identity.backend;
+        output.device_id = identity.device_id;
         output.name = identity.name;
         output.description = identity.description;
         if (const auto value = llama_rs_fit_find_device(initial, identity)) {
@@ -682,6 +716,9 @@ extern "C" bool llama_rs_fit_report_get_device(
     out_device->index = index;
     out_device->kind = source.kind;
     out_device->backend_type = source.backend_type;
+    out_device->backend = source.backend.c_str();
+    out_device->device_id =
+        source.device_id.empty() ? nullptr : source.device_id.c_str();
     out_device->name = source.name.c_str();
     out_device->description = source.description.c_str();
     out_device->initial_available = source.initial_available;

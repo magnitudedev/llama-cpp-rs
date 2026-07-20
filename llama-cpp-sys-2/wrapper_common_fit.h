@@ -94,6 +94,8 @@ typedef struct llama_rs_fit_device {
     size_t index;
     enum llama_rs_fit_device_kind kind;
     int32_t backend_type;
+    const char * backend;
+    const char * device_id;
     const char * name;
     const char * description;
     bool initial_available;

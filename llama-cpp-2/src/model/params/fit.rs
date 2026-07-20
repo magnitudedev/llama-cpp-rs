@@ -152,6 +152,10 @@ pub struct FitDeviceEstimate {
     pub kind: FitDeviceKind,
     /// Raw `ggml_backend_dev_type` value from the pinned backend.
     pub backend_type: i32,
+    /// Backend registration name.
+    pub backend: String,
+    /// Backend-reported physical device identity, when available.
+    pub device_id: Option<String>,
     /// Backend device name.
     pub name: String,
     /// Human-readable backend description.
@@ -736,6 +740,8 @@ fn decode_device(
         index: raw.index,
         kind,
         backend_type: raw.backend_type,
+        backend: borrowed_string(raw.backend, "devices[].backend")?,
+        device_id: optional_borrowed_string(raw.device_id, "devices[].device_id")?,
         name: borrowed_string(raw.name, "devices[].name")?,
         description: borrowed_string(raw.description, "devices[].description")?,
         initial: raw
