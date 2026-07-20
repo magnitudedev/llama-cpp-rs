@@ -191,8 +191,14 @@ extern "C" llama_rs_status llama_rs_mtmd_bitmap_init_from_file(
     }
 
     try {
+        const auto wrapped = mtmd_helper_bitmap_init_from_file(context, path, placeholder);
+        if (wrapped.video_ctx) {
+            mtmd_bitmap_free(wrapped.bitmap);
+            mtmd_helper_video_free(wrapped.video_ctx);
+            throw std::runtime_error("video bitmaps are not enabled by this binding");
+        }
         std::unique_ptr<mtmd_bitmap, decltype(&mtmd_bitmap_free)> bitmap(
-            mtmd_helper_bitmap_init_from_file(context, path, placeholder),
+            wrapped.bitmap,
             &mtmd_bitmap_free);
         *out_bitmap = bitmap.release();
         return LLAMA_RS_STATUS_OK;
@@ -222,8 +228,15 @@ extern "C" llama_rs_status llama_rs_mtmd_bitmap_init_from_buffer(
     }
 
     try {
+        const auto wrapped = mtmd_helper_bitmap_init_from_buf(
+            context, data, data_len, placeholder);
+        if (wrapped.video_ctx) {
+            mtmd_bitmap_free(wrapped.bitmap);
+            mtmd_helper_video_free(wrapped.video_ctx);
+            throw std::runtime_error("video bitmaps are not enabled by this binding");
+        }
         std::unique_ptr<mtmd_bitmap, decltype(&mtmd_bitmap_free)> bitmap(
-            mtmd_helper_bitmap_init_from_buf(context, data, data_len, placeholder),
+            wrapped.bitmap,
             &mtmd_bitmap_free);
         *out_bitmap = bitmap.release();
         return LLAMA_RS_STATUS_OK;

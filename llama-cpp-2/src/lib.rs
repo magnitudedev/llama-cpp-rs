@@ -502,6 +502,9 @@ pub struct LlamaBackendDevice {
     pub description: String,
     /// The backend of the device (e.g. "Vulkan", "CUDA", "CPU")
     pub backend: String,
+    /// Backend-reported physical device identity, such as a PCI bus address. `None` means the
+    /// backend cannot prove cross-backend physical identity.
+    pub device_id: Option<String>,
     /// Total memory of the device in bytes
     pub memory_total: usize,
     /// Free memory of the device in bytes
@@ -535,6 +538,7 @@ pub fn list_llama_ggml_backend_devices() -> Vec<LlamaBackendDevice> {
         let backend = unsafe { llama_cpp_sys_2::ggml_backend_dev_backend_reg(dev) };
         let backend_name = unsafe { llama_cpp_sys_2::ggml_backend_reg_name(backend) };
         let backend = cstr_to_string(backend_name);
+        let device_id = (!props.device_id.is_null()).then(|| cstr_to_string(props.device_id));
         let memory_total = props.memory_total;
         let memory_free = props.memory_free;
         let device_type = match props.type_ {
@@ -549,6 +553,7 @@ pub fn list_llama_ggml_backend_devices() -> Vec<LlamaBackendDevice> {
             name,
             description,
             backend,
+            device_id,
             memory_total,
             memory_free,
             device_type,

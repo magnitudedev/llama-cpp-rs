@@ -22,8 +22,6 @@ use crate::{
 };
 
 pub mod kv_cache;
-#[cfg(feature = "common")]
-pub mod memory;
 pub mod params;
 pub mod session;
 

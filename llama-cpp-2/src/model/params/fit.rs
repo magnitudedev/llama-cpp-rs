@@ -10,6 +10,13 @@ use crate::model::params::LlamaModelParams;
 
 use llama_cpp_sys_2 as sys;
 
+/// Resolve the exact math-thread default from the pinned native common runtime.
+#[must_use]
+pub fn default_math_threads() -> u32 {
+    let value = unsafe { sys::llama_rs_common_default_math_threads() };
+    value.max(1).cast_unsigned()
+}
+
 /// Outcome returned by the pinned `common_fit_params` implementation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize))]
@@ -74,6 +81,8 @@ pub struct FitModelInfo {
     pub context_tokens: u32,
     /// Number of experts, or zero for a dense model.
     pub expert_count: u32,
+    /// Exact tensor storage bytes reported by llama.cpp, independent of active experts.
+    pub tensor_bytes: u64,
 }
 
 /// Allocation classes reported by llama.cpp's graph planner.
@@ -384,6 +393,63 @@ impl Drop for NativeFitReport {
 }
 
 impl LlamaModelParams {
+    /// Measure several execution contexts while constructing the no-allocation model once.
+    ///
+    /// This is an exact projection of llama.cpp model/context graphs. It does not run
+    /// `common_fit_params` or alter the supplied parameters.
+    pub fn measure_contexts(
+        &self,
+        model_path: &CStr,
+        contexts: &[LlamaContextParams],
+        margins: &[usize],
+    ) -> Result<Vec<FitReport>, FitReportError> {
+        let _logger_guard = crate::log::lock_native_logger();
+        let max_devices = unsafe { sys::llama_max_devices() };
+        if margins.len() < max_devices {
+            return Err(FitReportError::InvalidMargins {
+                provided: margins.len(),
+                required: max_devices,
+            });
+        }
+        let raw_contexts = contexts
+            .iter()
+            .map(|context| context.context_params)
+            .collect::<Vec<_>>();
+        let mut raw_reports = vec![ptr::null_mut(); contexts.len()];
+        let mut native_error: *mut c_char = ptr::null_mut();
+        let status = unsafe {
+            sys::llama_rs_fit_measure_reports_create(
+                model_path.as_ptr(),
+                &raw const self.params,
+                raw_contexts.as_ptr(),
+                raw_contexts.len(),
+                margins.as_ptr(),
+                margins.len(),
+                sys::GGML_LOG_LEVEL_ERROR,
+                raw_reports.as_mut_ptr(),
+                &raw mut native_error,
+            )
+        };
+        if status != sys::LLAMA_RS_STATUS_OK {
+            return Err(FitReportError::Native {
+                status,
+                message: take_native_error(native_error),
+            });
+        }
+        if !native_error.is_null() {
+            unsafe { sys::llama_rs_string_free(native_error) };
+        }
+        raw_reports
+            .into_iter()
+            .map(|report| {
+                let report = NativeFitReport(
+                    NonNull::new(report).ok_or(FitReportError::Malformed("null batch report"))?,
+                );
+                decode_report(&report)
+            })
+            .collect()
+    }
+
     /// Fit unset model/context parameters and return structured memory diagnostics.
     ///
     /// The estimator uses llama.cpp's no-allocation model/context planning path:
@@ -500,8 +566,15 @@ impl LlamaModelParams {
         };
 
         // common/fit may point the raw params at these buffers even on a failed
-        // fit attempt, so always restore their stable, owned addresses.
-        self.params.tensor_split = original_tensor_split;
+        // fit attempt. Preserve an explicit caller split, otherwise retain the
+        // fitted split in this parameter object's owned storage so the exact
+        // parameters that produced the report can be consumed by model loading.
+        if original_tensor_split.is_null() {
+            self.tensor_split = fitted_tensor_split;
+            self.params.tensor_split = self.tensor_split.as_ptr();
+        } else {
+            self.params.tensor_split = original_tensor_split;
+        }
         self.params.tensor_buft_overrides = self.buft_overrides.as_ptr();
 
         if status != sys::LLAMA_RS_STATUS_OK {
@@ -608,6 +681,7 @@ fn decode_report(native: &NativeFitReport) -> Result<FitReport, FitReportError> 
             offloadable_layer_count,
             context_tokens: summary.model_context_tokens,
             expert_count: summary.model_expert_count,
+            tensor_bytes: summary.model_tensor_bytes,
         },
         devices,
         tensor_split,

@@ -301,8 +301,7 @@ pub struct ChatPrepareOptions {
     pub parallel_tool_calls: Option<bool>,
     /// Reasoning response format.
     pub reasoning_format: ChatReasoningFormat,
-    /// Explicitly control thinking. `None` omits the Jinja variable and preserves the template's
-    /// authored default.
+    /// Explicitly control thinking. `None` uses llama.cpp's enabled default.
     pub enable_thinking: Option<bool>,
     /// Additional JSON-valued Jinja arguments.
     pub template_kwargs: Vec<ChatTemplateKwarg>,
@@ -323,7 +322,7 @@ impl Default for ChatPrepareOptions {
             tool_choice: ChatToolChoice::Auto,
             parallel_tool_calls: None,
             reasoning_format: ChatReasoningFormat::DeepSeek,
-            enable_thinking: Some(true),
+            enable_thinking: None,
             template_kwargs: Vec::new(),
             force_pure_content: false,
         }
@@ -400,17 +399,6 @@ pub enum ChatGrammarTrigger {
     PatternFull(String),
 }
 
-/// A role-labelled byte span in the rendered prompt.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ChatMessageSpan {
-    /// Message role.
-    pub role: String,
-    /// Byte offset in the prompt.
-    pub position: usize,
-    /// Byte length.
-    pub length: usize,
-}
-
 /// RAII owner of llama.cpp's compiled common chat templates.
 #[derive(Debug)]
 pub struct CommonChatTemplates {
@@ -437,7 +425,7 @@ impl CommonChatTemplates {
         template_override: Option<&str>,
     ) -> Result<Self, CommonChatError> {
         let template = optional_c_string(template_override)?;
-        Self::init(model.model.as_ptr(), template.as_ref(), None, None, None)
+        Self::init(model.model.as_ptr(), template.as_ref(), None, None)
     }
 
     /// Compile an explicit template without loading a model.
@@ -460,29 +448,6 @@ impl CommonChatTemplates {
             Some(&template),
             bos.as_ref(),
             eos.as_ref(),
-            None,
-        )
-    }
-
-    /// Reproduce model template selection from extracted GGUF metadata without loading weights.
-    /// Missing default metadata uses the pinned llama.cpp fallback; `tool_use` remains available
-    /// for the same named-template selection used by execution.
-    pub fn from_metadata(
-        default_template: Option<&str>,
-        tool_use_template: Option<&str>,
-        bos_token: Option<&str>,
-        eos_token: Option<&str>,
-    ) -> Result<Self, CommonChatError> {
-        let template = optional_c_string(default_template)?;
-        let tool_use = optional_c_string(tool_use_template)?;
-        let bos = optional_c_string(bos_token)?;
-        let eos = optional_c_string(eos_token)?;
-        Self::init(
-            ptr::null(),
-            template.as_ref(),
-            bos.as_ref(),
-            eos.as_ref(),
-            tool_use.as_ref(),
         )
     }
 
@@ -491,7 +456,6 @@ impl CommonChatTemplates {
         template: Option<&CString>,
         bos: Option<&CString>,
         eos: Option<&CString>,
-        tool_use: Option<&CString>,
     ) -> Result<Self, CommonChatError> {
         let mut raw = ptr::null_mut();
         let mut error = ptr::null_mut();
@@ -501,7 +465,6 @@ impl CommonChatTemplates {
                 c_string_ptr(template),
                 c_string_ptr(bos),
                 c_string_ptr(eos),
-                c_string_ptr(tool_use),
                 &raw mut raw,
                 &raw mut error,
             )
@@ -635,7 +598,6 @@ pub struct PreparedChat {
     grammar_triggers: Vec<ChatGrammarTrigger>,
     preserved_tokens: Vec<String>,
     additional_stops: Vec<String>,
-    message_spans: Vec<ChatMessageSpan>,
 }
 
 impl PreparedChat {
@@ -664,7 +626,6 @@ impl PreparedChat {
         let additional_stops =
             prepared_string_list(raw_ptr, sys::LLAMA_RS_CHAT_PREPARED_ADDITIONAL_STOPS)?;
         let grammar_triggers = prepared_grammar_triggers(raw_ptr)?;
-        let message_spans = prepared_message_spans(raw_ptr)?;
         let grammar_lazy = unsafe { sys::llama_rs_chat_prepared_grammar_lazy(raw_ptr) };
         let supports_thinking = unsafe { sys::llama_rs_chat_prepared_supports_thinking(raw_ptr) };
 
@@ -683,7 +644,6 @@ impl PreparedChat {
             grammar_triggers,
             preserved_tokens,
             additional_stops,
-            message_spans,
         })
     }
 
@@ -763,12 +723,6 @@ impl PreparedChat {
     #[must_use]
     pub fn additional_stops(&self) -> &[String] {
         &self.additional_stops
-    }
-
-    /// Role-labelled spans in the rendered prompt.
-    #[must_use]
-    pub fn message_spans(&self) -> &[ChatMessageSpan] {
-        &self.message_spans
     }
 
     /// Instantiate an incremental parser from the prepared configuration.
@@ -1287,8 +1241,7 @@ impl EncodedPrepareOptions {
             parallel_tool_calls_set: self.parallel_tool_calls.is_some(),
             parallel_tool_calls: self.parallel_tool_calls.unwrap_or(false),
             reasoning_format: self.reasoning_format.raw(),
-            enable_thinking_set: self.enable_thinking.is_some(),
-            enable_thinking: self.enable_thinking.unwrap_or(false),
+            enable_thinking: self.enable_thinking.unwrap_or(true),
             template_kwargs: slice_ptr(&self.raw_kwargs),
             template_kwargs_count: self.raw_kwargs.len(),
             force_pure_content: self.force_pure_content,
@@ -1405,32 +1358,6 @@ fn prepared_grammar_triggers(
                     value: i64::from(kind),
                 }),
             }
-        })
-        .collect()
-}
-
-fn prepared_message_spans(
-    prepared: *const sys::llama_rs_chat_prepared,
-) -> Result<Vec<ChatMessageSpan>, CommonChatError> {
-    let count = unsafe { sys::llama_rs_chat_prepared_message_span_count(prepared) };
-    (0..count)
-        .map(|index| {
-            let mut raw = sys::llama_rs_chat_message_span {
-                role: ptr::null_mut(),
-                pos: 0,
-                len: 0,
-            };
-            let status = unsafe {
-                sys::llama_rs_chat_prepared_message_span_get(prepared, index, &raw mut raw)
-            };
-            check_status_without_error(status)?;
-            let role = take_owned_string(raw.role, "message span role")?;
-            raw.role = ptr::null_mut();
-            Ok(ChatMessageSpan {
-                role,
-                position: raw.pos,
-                length: raw.len,
-            })
         })
         .collect()
 }
@@ -1720,38 +1647,6 @@ mod tests {
     // Keep this fixture in the safe crate so its published package tests do not
     // depend on a sibling sys-crate checkout being present.
     const QWEN3: &str = include_str!("../tests/fixtures/Qwen-Qwen3-0.6B.jinja");
-
-    const AUTHORED_DISABLED: &str = r"{% set enable_thinking = enable_thinking | default(false) %}{% if enable_thinking %}<think>{% endif %}assistant:";
-
-    #[test]
-    fn optional_enable_thinking_preserves_authored_default() {
-        let templates = CommonChatTemplates::from_template(AUTHORED_DISABLED, None, None).unwrap();
-        let render = |enable_thinking| {
-            templates
-                .prepare(&ChatPrepareOptions {
-                    enable_thinking,
-                    ..ChatPrepareOptions::default()
-                })
-                .unwrap()
-                .prompt()
-                .to_owned()
-        };
-        assert_eq!(render(None), "assistant:");
-        assert_eq!(render(Some(false)), "assistant:");
-        assert_eq!(render(Some(true)), "<think>assistant:");
-    }
-
-    #[test]
-    fn metadata_constructor_applies_fallback_and_named_tool_template() {
-        let fallback = CommonChatTemplates::from_metadata(None, None, None, None).unwrap();
-        assert!(!fallback.source(None).unwrap().is_empty());
-        assert!(!fallback.was_explicit());
-
-        let tool = "{% for message in messages %}tool:{{ message['content'] }}{% endfor %}";
-        let templates = CommonChatTemplates::from_metadata(None, Some(tool), None, None).unwrap();
-        assert_eq!(templates.source(Some("tool_use")).unwrap(), tool);
-        assert!(templates.was_explicit());
-    }
 
     #[test]
     fn template_override_prepares_and_parses_content() {

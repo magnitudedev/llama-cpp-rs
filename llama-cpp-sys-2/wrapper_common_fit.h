@@ -8,11 +8,14 @@
 #include <stdint.h>
 
 struct llama_rs_fit_report;
-struct llama_rs_context_memory_report;
 
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+// Resolve the pinned common runtime's math-thread default. Callers must use
+// this instead of mirroring platform-specific common code.
+int32_t llama_rs_common_default_math_threads(void);
 
 // Fit model/context params to device memory (wraps llama.cpp's common_fit_params).
 // Returns common_params_fit_status as an int: 0 = success, 1 = failure, 2 = error.
@@ -67,11 +70,25 @@ typedef struct llama_rs_fit_summary {
     uint32_t model_layer_count;
     uint32_t model_context_tokens;
     uint32_t model_expert_count;
+    uint64_t model_tensor_bytes;
     size_t accelerator_count;
     bool initial_measurement_available;
     bool fitted_measurement_available;
     int64_t elapsed_microseconds;
 } llama_rs_fit_summary;
+
+// Measures several contexts against one no-allocation model construction. Each
+// returned report contains an initial measurement only; no fitting is run.
+llama_rs_status llama_rs_fit_measure_reports_create(
+    const char * path_model,
+    const struct llama_model_params * mparams,
+    const struct llama_context_params * cparams,
+    size_t profile_count,
+    const size_t * margins,
+    size_t margins_count,
+    enum ggml_log_level log_level,
+    struct llama_rs_fit_report ** out_reports,
+    char ** out_error);
 
 typedef struct llama_rs_fit_device {
     size_t index;
@@ -157,58 +174,6 @@ bool llama_rs_fit_report_get_placement(
     const struct llama_rs_fit_report * report,
     size_t index,
     struct llama_rs_fit_placement * out_placement);
-
-// Stable, owner-borrowed projection of llama_get_memory_breakdown(). The report owns every string
-// referenced by the byte views below. Views remain valid until the report is freed. The pinned
-// upstream breakdown does not include llama_context's private logits/embeddings output buffer.
-typedef struct llama_rs_context_memory_values {
-    uint64_t model_bytes;
-    uint64_t context_bytes;
-    uint64_t compute_bytes;
-} llama_rs_context_memory_values;
-
-typedef struct llama_rs_context_device_memory {
-    bool has_device_index;
-    size_t device_index;
-    int32_t backend_type;
-    struct llama_rs_bytes_view name;
-    struct llama_rs_bytes_view description;
-    bool has_total_bytes;
-    uint64_t total_bytes;
-    bool has_free_bytes;
-    uint64_t free_bytes;
-    struct llama_rs_context_memory_values allocations;
-} llama_rs_context_device_memory;
-
-typedef struct llama_rs_buffer_type_memory {
-    struct llama_rs_bytes_view name;
-    struct llama_rs_context_memory_values allocations;
-} llama_rs_buffer_type_memory;
-
-llama_rs_status llama_rs_context_memory_report_create(
-    const struct llama_context * context,
-    struct llama_rs_context_memory_report ** out_report,
-    char ** out_error);
-
-void llama_rs_context_memory_report_free(struct llama_rs_context_memory_report * report);
-
-size_t llama_rs_context_memory_report_device_count(
-    const struct llama_rs_context_memory_report * report);
-
-llama_rs_status llama_rs_context_memory_report_device_get(
-    const struct llama_rs_context_memory_report * report,
-    size_t index,
-    struct llama_rs_context_device_memory * out_device,
-    char ** out_error);
-
-size_t llama_rs_context_memory_report_other_count(
-    const struct llama_rs_context_memory_report * report);
-
-llama_rs_status llama_rs_context_memory_report_other_get(
-    const struct llama_rs_context_memory_report * report,
-    size_t index,
-    struct llama_rs_buffer_type_memory * out_buffer,
-    char ** out_error);
 
 void llama_rs_memory_breakdown_print(const struct llama_context * ctx);
 

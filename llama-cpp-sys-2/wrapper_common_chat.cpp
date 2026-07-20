@@ -395,7 +395,6 @@ extern "C" llama_rs_status llama_rs_chat_templates_init(
     const char * template_override,
     const char * bos_token_override,
     const char * eos_token_override,
-    const char * tool_use_template_override,
     struct llama_rs_chat_templates ** out_templates,
     char ** out_error) {
     if (out_error) {
@@ -411,8 +410,7 @@ extern "C" llama_rs_status llama_rs_chat_templates_init(
             model,
             llama_rs_chat_optional_string(template_override),
             llama_rs_chat_optional_string(bos_token_override),
-            llama_rs_chat_optional_string(eos_token_override),
-            llama_rs_chat_optional_string(tool_use_template_override));
+            llama_rs_chat_optional_string(eos_token_override));
         auto wrapper = std::make_unique<llama_rs_chat_templates>(std::move(templates));
         *out_templates = wrapper.release();
         return LLAMA_RS_STATUS_OK;
@@ -573,7 +571,6 @@ extern "C" llama_rs_status llama_rs_chat_templates_prepare(
             ? options->parallel_tool_calls
             : common_chat_templates_get_caps(templates->value.get()).at("supports_parallel_tool_calls");
         inputs.reasoning_format = llama_rs_chat_convert_reasoning_format(options->reasoning_format);
-        inputs.enable_thinking_set = options->enable_thinking_set;
         inputs.enable_thinking = options->enable_thinking;
         for (size_t i = 0; i < options->template_kwargs_count; ++i) {
             const auto & kwarg = options->template_kwargs[i];
@@ -712,26 +709,6 @@ extern "C" llama_rs_status llama_rs_chat_prepared_grammar_trigger_get(
     out_trigger->token = source.token;
     out_trigger->value = llama_rs_dup_string(source.value);
     return out_trigger->value ? LLAMA_RS_STATUS_OK : LLAMA_RS_STATUS_ALLOCATION_FAILED;
-}
-
-extern "C" size_t llama_rs_chat_prepared_message_span_count(
-    const struct llama_rs_chat_prepared * prepared) {
-    return prepared ? prepared->value.message_spans.size() : 0;
-}
-
-extern "C" llama_rs_status llama_rs_chat_prepared_message_span_get(
-    const struct llama_rs_chat_prepared * prepared,
-    size_t index,
-    struct llama_rs_chat_message_span * out_span) {
-    if (!prepared || !out_span || index >= prepared->value.message_spans.size()) {
-        return LLAMA_RS_STATUS_INVALID_ARGUMENT;
-    }
-    out_span->role = nullptr;
-    const auto & source = prepared->value.message_spans[index];
-    out_span->pos = source.pos;
-    out_span->len = source.len;
-    out_span->role = llama_rs_dup_string(source.role);
-    return out_span->role ? LLAMA_RS_STATUS_OK : LLAMA_RS_STATUS_ALLOCATION_FAILED;
 }
 
 extern "C" llama_rs_status llama_rs_chat_parser_init(
@@ -1102,12 +1079,5 @@ extern "C" void llama_rs_chat_grammar_trigger_clear(struct llama_rs_chat_grammar
     if (trigger) {
         llama_rs_string_free(trigger->value);
         trigger->value = nullptr;
-    }
-}
-
-extern "C" void llama_rs_chat_message_span_clear(struct llama_rs_chat_message_span * span) {
-    if (span) {
-        llama_rs_string_free(span->role);
-        span->role = nullptr;
     }
 }

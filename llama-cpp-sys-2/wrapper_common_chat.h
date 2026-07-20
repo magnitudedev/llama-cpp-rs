@@ -124,7 +124,6 @@ typedef struct llama_rs_chat_prepare_options {
     bool parallel_tool_calls_set;
     bool parallel_tool_calls;
     enum llama_rs_chat_reasoning_format reasoning_format;
-    bool enable_thinking_set;
     bool enable_thinking;
     const struct llama_rs_chat_template_kwarg_input * template_kwargs;
     size_t template_kwargs_count;
@@ -157,12 +156,6 @@ typedef struct llama_rs_chat_grammar_trigger {
     llama_token token;
 } llama_rs_chat_grammar_trigger;
 
-typedef struct llama_rs_chat_message_span {
-    char * role;
-    size_t pos;
-    size_t len;
-} llama_rs_chat_message_span;
-
 // Borrowed projection into an owning llama_rs_chat_parse_result. Every byte
 // view remains valid only until that parse-result owner is freed.
 typedef struct llama_rs_chat_tool_call {
@@ -194,7 +187,6 @@ llama_rs_status llama_rs_chat_templates_init(
     const char * template_override,
     const char * bos_token_override,
     const char * eos_token_override,
-    const char * tool_use_template_override,
     struct llama_rs_chat_templates ** out_templates,
     char ** out_error);
 
@@ -251,13 +243,6 @@ llama_rs_status llama_rs_chat_prepared_grammar_trigger_get(
     const struct llama_rs_chat_prepared * prepared,
     size_t index,
     struct llama_rs_chat_grammar_trigger * out_trigger);
-
-size_t llama_rs_chat_prepared_message_span_count(const struct llama_rs_chat_prepared * prepared);
-
-llama_rs_status llama_rs_chat_prepared_message_span_get(
-    const struct llama_rs_chat_prepared * prepared,
-    size_t index,
-    struct llama_rs_chat_message_span * out_span);
 
 llama_rs_status llama_rs_chat_parser_init(
     const struct llama_rs_chat_prepared * prepared,
@@ -344,8 +329,6 @@ llama_rs_status llama_rs_chat_parse_result_tool_call_get(
     struct llama_rs_chat_tool_call * out_tool_call);
 
 void llama_rs_chat_grammar_trigger_clear(struct llama_rs_chat_grammar_trigger * trigger);
-
-void llama_rs_chat_message_span_clear(struct llama_rs_chat_message_span * span);
 
 #ifdef __cplusplus
 }

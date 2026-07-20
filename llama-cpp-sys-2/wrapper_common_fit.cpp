@@ -14,8 +14,10 @@
 #include <utility>
 #include <vector>
 
+#include "llama.cpp/common/common.h"
 #include "llama.cpp/common/fit.h"
 #include "llama.cpp/include/llama.h"
+#include "llama.cpp/src/llama-ext.h"
 #include "wrapper_utils.h"
 
 // The legacy llama_rs_fit_params ABI returns the upstream numeric status and
@@ -33,6 +35,10 @@ static_assert(
 
 static std::string llama_rs_fit_string(const char * value);
 
+extern "C" int32_t llama_rs_common_default_math_threads(void) {
+    return common_cpu_get_num_math();
+}
+
 struct llama_rs_fit_measurement_device {
     enum llama_rs_fit_device_kind kind = LLAMA_RS_FIT_DEVICE_ACCELERATOR;
     ggml_backend_dev_t device = nullptr;
@@ -48,8 +54,84 @@ struct llama_rs_fit_measurement {
     uint32_t model_layer_count = 0;
     uint32_t model_context_tokens = 0;
     uint32_t model_expert_count = 0;
+    uint64_t model_tensor_bytes = 0;
     std::vector<llama_rs_fit_measurement_device> devices;
 };
+
+static struct llama_rs_fit_measurement llama_rs_fit_measure_loaded(
+    const struct llama_model * model,
+    const struct llama_context_params * cparams) {
+    struct llama_rs_fit_measurement result;
+    std::unique_ptr<llama_context, decltype(&llama_free)> context(
+        llama_init_from_model(const_cast<llama_model *>(model), *cparams), llama_free);
+    if (!context) {
+        throw std::runtime_error("failed to create llama_context from model");
+    }
+
+    const size_t device_count = llama_model_n_devices(model);
+    const auto memory = llama_get_memory_breakdown(context.get());
+    result.devices.reserve(device_count + 1);
+    for (size_t index = 0; index < device_count; ++index) {
+        const auto device = llama_model_get_device(model, index);
+        if (!device) {
+            throw std::runtime_error("llama.cpp returned a null model device");
+        }
+        llama_rs_fit_measurement_device value;
+        value.kind = LLAMA_RS_FIT_DEVICE_ACCELERATOR;
+        value.device = device;
+        value.backend_type = static_cast<int32_t>(ggml_backend_dev_type(device));
+        value.name = llama_rs_fit_string(ggml_backend_dev_name(device));
+        value.description = llama_rs_fit_string(ggml_backend_dev_description(device));
+        size_t free_bytes = 0;
+        size_t total_bytes = 0;
+        ggml_backend_dev_memory(device, &free_bytes, &total_bytes);
+        value.memory.free_bytes = static_cast<int64_t>(free_bytes);
+        value.memory.total_bytes = static_cast<int64_t>(total_bytes);
+        result.devices.push_back(std::move(value));
+    }
+
+    llama_rs_fit_measurement_device host;
+    host.kind = LLAMA_RS_FIT_DEVICE_HOST;
+    const auto cpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+    host.device = cpu;
+    host.backend_type = static_cast<int32_t>(GGML_BACKEND_DEVICE_TYPE_CPU);
+    host.name = cpu ? llama_rs_fit_string(ggml_backend_dev_name(cpu)) : "CPU";
+    host.description = cpu ? llama_rs_fit_string(ggml_backend_dev_description(cpu)) : "Host memory";
+    if (!cpu) {
+        throw std::runtime_error("no CPU backend found");
+    }
+    size_t host_free_bytes = 0;
+    size_t host_total_bytes = 0;
+    ggml_backend_dev_memory(cpu, &host_free_bytes, &host_total_bytes);
+    host.memory.free_bytes = static_cast<int64_t>(host_free_bytes);
+    host.memory.total_bytes = static_cast<int64_t>(host_total_bytes);
+    result.devices.push_back(std::move(host));
+
+    for (const auto & [buffer_type, breakdown] : memory) {
+        llama_rs_fit_measurement_device * target = nullptr;
+        if (ggml_backend_buft_is_host(buffer_type)) {
+            target = &result.devices.back();
+        } else if (const auto device = ggml_backend_buft_get_device(buffer_type)) {
+            const auto found = std::find_if(result.devices.begin(), result.devices.end(),
+                [&](const auto & candidate) { return candidate.device == device; });
+            if (found != result.devices.end()) {
+                target = &*found;
+            }
+        }
+        if (target) {
+            target->memory.model_bytes += breakdown.model;
+            target->memory.context_bytes += breakdown.context;
+            target->memory.compute_bytes += breakdown.compute;
+        }
+    }
+
+    result.model_layer_count = llama_model_n_layer(model);
+    result.model_context_tokens = llama_model_n_ctx_train(model);
+    result.model_expert_count = llama_model_n_expert(model);
+    result.model_tensor_bytes = llama_model_size(model);
+    result.available = true;
+    return result;
+}
 
 struct llama_rs_fit_device_storage {
     enum llama_rs_fit_device_kind kind = LLAMA_RS_FIT_DEVICE_ACCELERATOR;
@@ -83,31 +165,6 @@ struct llama_rs_fit_report {
     std::vector<llama_rs_fit_placement_storage> placements;
 };
 
-struct llama_rs_context_device_memory_storage {
-    ggml_backend_dev_t device = nullptr;
-    bool has_device_index = false;
-    size_t device_index = 0;
-    int32_t backend_type = 0;
-    std::string name;
-    std::string description;
-    bool has_total_bytes = false;
-    uint64_t total_bytes = 0;
-    bool has_free_bytes = false;
-    uint64_t free_bytes = 0;
-    struct llama_rs_context_memory_values allocations = {};
-    size_t registry_order = std::numeric_limits<size_t>::max();
-};
-
-struct llama_rs_buffer_type_memory_storage {
-    std::string name;
-    struct llama_rs_context_memory_values allocations = {};
-};
-
-struct llama_rs_context_memory_report {
-    std::vector<llama_rs_context_device_memory_storage> devices;
-    std::vector<llama_rs_buffer_type_memory_storage> other_buffer_types;
-};
-
 struct llama_rs_context_other_guard {
     llama_context_params * params;
     llama_context * original;
@@ -123,207 +180,10 @@ struct llama_rs_context_other_guard {
     }
 };
 
-static struct llama_rs_bytes_view llama_rs_context_memory_view(const std::string & value) {
-    return {
-        reinterpret_cast<const uint8_t *>(value.data()),
-        value.size(),
-    };
-}
-
-static void llama_rs_context_memory_add(
-    uint64_t & target,
-    size_t value,
-    const char * category) {
-    static_assert(sizeof(size_t) <= sizeof(uint64_t), "size_t must fit into uint64_t");
-    const uint64_t converted = static_cast<uint64_t>(value);
-    if (converted > std::numeric_limits<uint64_t>::max() - target) {
-        throw std::overflow_error(std::string("context memory ") + category + " total overflowed u64");
-    }
-    target += converted;
-}
-
-static void llama_rs_context_memory_add(
-    struct llama_rs_context_memory_values & target,
-    const struct llama_memory_breakdown_data & source) {
-    llama_rs_context_memory_add(target.model_bytes, source.model, "model");
-    llama_rs_context_memory_add(target.context_bytes, source.context, "context");
-    llama_rs_context_memory_add(target.compute_bytes, source.compute, "compute");
-}
-
-static size_t llama_rs_context_memory_registry_order(ggml_backend_dev_t device) {
-    const size_t count = ggml_backend_dev_count();
-    for (size_t index = 0; index < count; ++index) {
-        if (ggml_backend_dev_get(index) == device) {
-            return index;
-        }
-    }
-    return std::numeric_limits<size_t>::max();
-}
-
-static struct llama_rs_context_device_memory_storage llama_rs_context_memory_device(
-    ggml_backend_dev_t device,
-    bool has_device_index,
-    size_t device_index) {
-    if (!device) {
-        throw std::runtime_error("llama.cpp returned a null backend device");
-    }
-
-    llama_rs_context_device_memory_storage result;
-    result.device = device;
-    result.has_device_index = has_device_index;
-    result.device_index = device_index;
-    result.backend_type = static_cast<int32_t>(ggml_backend_dev_type(device));
-    result.name = llama_rs_fit_string(ggml_backend_dev_name(device));
-    result.description = llama_rs_fit_string(ggml_backend_dev_description(device));
-    result.registry_order = llama_rs_context_memory_registry_order(device);
-    return result;
-}
-
-static void llama_rs_context_memory_read_totals(
-    struct llama_rs_context_device_memory_storage & device) {
-    if (!device.device) {
-        return;
-    }
-    size_t free = 0;
-    size_t total = 0;
-    ggml_backend_dev_memory(device.device, &free, &total);
-    // llama.cpp treats 0/0 as an unavailable memory budget for a backend.
-    if (free == 0 && total == 0) {
-        return;
-    }
-    device.has_total_bytes = true;
-    device.total_bytes = static_cast<uint64_t>(total);
-    device.has_free_bytes = true;
-    device.free_bytes = static_cast<uint64_t>(free);
-}
-
-static std::unique_ptr<llama_rs_context_memory_report> llama_rs_context_memory_build(
-    const struct llama_context * context) {
-    const auto * model = llama_get_model(context);
-    if (!model) {
-        throw std::runtime_error("llama.cpp context has no model");
-    }
-
-    auto report = std::make_unique<llama_rs_context_memory_report>();
-    const int32_t model_device_count = llama_model_n_devices(model);
-    if (model_device_count < 0) {
-        throw std::runtime_error("llama.cpp returned a negative model device count");
-    }
-    report->devices.reserve(static_cast<size_t>(model_device_count) + 1);
-    for (int32_t index = 0; index < model_device_count; ++index) {
-        report->devices.push_back(llama_rs_context_memory_device(
-            llama_model_get_device(model, index),
-            true,
-            static_cast<size_t>(index)));
-    }
-
-    llama_rs_context_device_memory_storage host;
-    host.backend_type = static_cast<int32_t>(GGML_BACKEND_DEVICE_TYPE_CPU);
-    host.name = "CPU";
-    host.description = "Host memory";
-    if (const auto cpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU)) {
-        host = llama_rs_context_memory_device(cpu, false, 0);
-    }
-
-    std::vector<llama_rs_context_device_memory_storage> unmatched_devices;
-    const auto memory_breakdown = llama_get_memory_breakdown(context);
-    for (const auto & [buffer_type, memory] : memory_breakdown) {
-        if (!buffer_type) {
-            throw std::runtime_error("llama.cpp memory breakdown contains a null buffer type");
-        }
-        if (ggml_backend_buft_is_host(buffer_type)) {
-            llama_rs_context_memory_add(host.allocations, memory);
-            continue;
-        }
-
-        const auto device = ggml_backend_buft_get_device(buffer_type);
-        if (device) {
-            auto registered = std::find_if(
-                report->devices.begin(),
-                report->devices.end(),
-                [device](const auto & candidate) { return candidate.device == device; });
-            if (registered != report->devices.end()) {
-                llama_rs_context_memory_add(registered->allocations, memory);
-                continue;
-            }
-
-            auto unmatched = std::find_if(
-                unmatched_devices.begin(),
-                unmatched_devices.end(),
-                [device](const auto & candidate) { return candidate.device == device; });
-            if (unmatched == unmatched_devices.end()) {
-                unmatched_devices.push_back(llama_rs_context_memory_device(device, false, 0));
-                unmatched = std::prev(unmatched_devices.end());
-            }
-            llama_rs_context_memory_add(unmatched->allocations, memory);
-            continue;
-        }
-
-        llama_rs_buffer_type_memory_storage other;
-        other.name = llama_rs_fit_string(ggml_backend_buft_name(buffer_type));
-        llama_rs_context_memory_add(other.allocations, memory);
-        report->other_buffer_types.push_back(std::move(other));
-    }
-
-    std::sort(
-        unmatched_devices.begin(),
-        unmatched_devices.end(),
-        [](const auto & left, const auto & right) {
-            return std::tie(
-                       left.registry_order,
-                       left.backend_type,
-                       left.name,
-                       left.description) <
-                std::tie(
-                       right.registry_order,
-                       right.backend_type,
-                       right.name,
-                       right.description);
-        });
-    report->devices.insert(
-        report->devices.end(),
-        std::make_move_iterator(unmatched_devices.begin()),
-        std::make_move_iterator(unmatched_devices.end()));
-    report->devices.push_back(std::move(host));
-
-    for (auto & device : report->devices) {
-        llama_rs_context_memory_read_totals(device);
-    }
-    std::sort(
-        report->other_buffer_types.begin(),
-        report->other_buffer_types.end(),
-        [](const auto & left, const auto & right) {
-            return std::tie(
-                       left.name,
-                       left.allocations.model_bytes,
-                       left.allocations.context_bytes,
-                       left.allocations.compute_bytes) <
-                std::tie(
-                       right.name,
-                       right.allocations.model_bytes,
-                       right.allocations.context_bytes,
-                       right.allocations.compute_bytes);
-        });
-    return report;
-}
-
 static std::string llama_rs_fit_string(const char * value) {
     return value ? value : "";
 }
 
-static struct llama_rs_fit_memory llama_rs_fit_copy_memory(
-    const struct llama_device_memory_data & source) {
-    struct llama_rs_fit_memory result = {};
-    result.total_bytes = source.total;
-    result.free_bytes = source.free;
-    result.model_bytes = source.mb.model;
-    result.context_bytes = source.mb.context;
-    result.compute_bytes = source.mb.compute;
-    return result;
-}
-
-// Pinned upstream common/fit temporarily installs a process-global logger backed by call-local
-// state. The safe Rust API documents that fit must not run concurrently with native work that logs.
 static struct llama_rs_fit_measurement llama_rs_fit_measure(
     const char * path_model,
     const struct llama_model_params * mparams,
@@ -332,31 +192,24 @@ static struct llama_rs_fit_measurement llama_rs_fit_measure(
     struct llama_rs_fit_measurement result;
     try {
         std::vector<ggml_backend_dev_t> devices;
-        uint32_t model_layer_count = 0;
-        uint32_t model_context_tokens = 0;
-        uint32_t model_expert_count = 0;
         const auto memory = common_get_device_memory_data(
             path_model,
             mparams,
             cparams,
             devices,
-            model_layer_count,
-            model_context_tokens,
-            model_expert_count,
-            log_level);
+            result.model_layer_count,
+            result.model_context_tokens,
+        result.model_expert_count,
+        log_level);
         if (memory.size() != devices.size() + 1) {
-            throw std::runtime_error("common/fit returned an invalid device memory result");
+            throw std::runtime_error("llama.cpp returned an inconsistent device memory report");
         }
-
-        result.model_layer_count = model_layer_count;
-        result.model_context_tokens = model_context_tokens;
-        result.model_expert_count = model_expert_count;
         result.devices.reserve(memory.size());
 
         for (size_t index = 0; index < devices.size(); ++index) {
             const auto device = devices[index];
             if (!device) {
-                throw std::runtime_error("common/fit returned a null accelerator device");
+                throw std::runtime_error("llama.cpp returned a null model device");
             }
             llama_rs_fit_measurement_device value;
             value.kind = LLAMA_RS_FIT_DEVICE_ACCELERATOR;
@@ -364,10 +217,15 @@ static struct llama_rs_fit_measurement llama_rs_fit_measure(
             value.backend_type = static_cast<int32_t>(ggml_backend_dev_type(device));
             value.name = llama_rs_fit_string(ggml_backend_dev_name(device));
             value.description = llama_rs_fit_string(ggml_backend_dev_description(device));
-            value.memory = llama_rs_fit_copy_memory(memory[index]);
+            value.memory.total_bytes = memory[index].total;
+            value.memory.free_bytes = memory[index].free;
+            value.memory.model_bytes = memory[index].model;
+            value.memory.context_bytes = memory[index].context;
+            value.memory.compute_bytes = memory[index].compute;
             result.devices.push_back(std::move(value));
         }
 
+        const auto & host_memory = memory.back();
         llama_rs_fit_measurement_device host;
         host.kind = LLAMA_RS_FIT_DEVICE_HOST;
         const auto cpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
@@ -377,7 +235,11 @@ static struct llama_rs_fit_measurement llama_rs_fit_measure(
         host.description = cpu
             ? llama_rs_fit_string(ggml_backend_dev_description(cpu))
             : "Host memory";
-        host.memory = llama_rs_fit_copy_memory(memory.back());
+        host.memory.total_bytes = host_memory.total;
+        host.memory.free_bytes = host_memory.free;
+        host.memory.model_bytes = host_memory.model;
+        host.memory.context_bytes = host_memory.context;
+        host.memory.compute_bytes = host_memory.compute;
         result.devices.push_back(std::move(host));
         result.available = true;
     } catch (const std::exception & error) {
@@ -638,6 +500,7 @@ static llama_rs_status llama_rs_fit_report_create_impl(
         report->summary.model_layer_count = hparams.model_layer_count;
         report->summary.model_context_tokens = hparams.model_context_tokens;
         report->summary.model_expert_count = hparams.model_expert_count;
+        report->summary.model_tensor_bytes = hparams.model_tensor_bytes;
         report->summary.accelerator_count = accelerator_count;
         report->summary.initial_measurement_available = initial.available;
         report->summary.fitted_measurement_available = fitted.available;
@@ -660,6 +523,77 @@ static llama_rs_status llama_rs_fit_report_create_impl(
         }
 
         *out_report = report.release();
+        return LLAMA_RS_STATUS_OK;
+    } catch (...) {
+        return llama_rs_chat_current_exception(out_error);
+    }
+}
+
+extern "C" llama_rs_status llama_rs_fit_measure_reports_create(
+    const char * path_model,
+    const struct llama_model_params * mparams,
+    const struct llama_context_params * cparams,
+    size_t profile_count,
+    const size_t * margins,
+    size_t margins_count,
+    enum ggml_log_level,
+    struct llama_rs_fit_report ** out_reports,
+    char ** out_error) {
+    if (out_error) {
+        *out_error = nullptr;
+    }
+    if (!path_model || !mparams || (!cparams && profile_count != 0) ||
+        !margins || !out_reports || margins_count < llama_max_devices()) {
+        return llama_rs_chat_set_error(out_error, LLAMA_RS_STATUS_INVALID_ARGUMENT,
+            "batch fit measurement arguments are invalid");
+    }
+    std::fill(out_reports, out_reports + profile_count, nullptr);
+    try {
+        llama_model_params loading = *mparams;
+        loading.no_alloc = true;
+        loading.use_mmap = false;
+        loading.use_mlock = false;
+        std::unique_ptr<llama_model, decltype(&llama_model_free)> model(
+            llama_model_load_from_file(path_model, loading), llama_model_free);
+        if (!model) {
+            throw std::runtime_error("failed to load model");
+        }
+
+        std::vector<std::unique_ptr<llama_rs_fit_report>> reports;
+        reports.reserve(profile_count);
+        for (size_t profile = 0; profile < profile_count; ++profile) {
+            const int64_t started_at = llama_time_us();
+            const auto measurement = llama_rs_fit_measure_loaded(model.get(), &cparams[profile]);
+            auto report = std::make_unique<llama_rs_fit_report>();
+            const llama_rs_fit_measurement empty;
+            llama_rs_fit_merge_devices(*report, measurement, empty, margins);
+            const size_t accelerator_count = std::count_if(
+                report->devices.begin(), report->devices.end(),
+                [](const auto & device) { return device.kind == LLAMA_RS_FIT_DEVICE_ACCELERATOR; });
+            report->summary.status = LLAMA_RS_FIT_STATUS_SUCCESS;
+            report->summary.requested_context_tokens = cparams[profile].n_ctx;
+            report->summary.fitted_context_tokens = cparams[profile].n_ctx;
+            report->summary.resolved_requested_context_tokens = llama_rs_fit_resolve_context(
+                cparams[profile].n_ctx, measurement.model_context_tokens);
+            report->summary.resolved_fitted_context_tokens = report->summary.resolved_requested_context_tokens;
+            report->summary.requested_gpu_layers = mparams->n_gpu_layers;
+            report->summary.fitted_gpu_layers = mparams->n_gpu_layers;
+            report->summary.resolved_requested_gpu_layers = llama_rs_fit_resolve_gpu_layers(
+                mparams->n_gpu_layers, measurement.model_layer_count, accelerator_count);
+            report->summary.resolved_fitted_gpu_layers = report->summary.resolved_requested_gpu_layers;
+            report->summary.model_layer_count = measurement.model_layer_count;
+            report->summary.model_context_tokens = measurement.model_context_tokens;
+            report->summary.model_expert_count = measurement.model_expert_count;
+            report->summary.model_tensor_bytes = measurement.model_tensor_bytes;
+            report->summary.accelerator_count = accelerator_count;
+            report->summary.initial_measurement_available = true;
+            report->summary.fitted_measurement_available = false;
+            report->summary.elapsed_microseconds = llama_time_us() - started_at;
+            reports.push_back(std::move(report));
+        }
+        for (size_t profile = 0; profile < profile_count; ++profile) {
+            out_reports[profile] = reports[profile].release();
+        }
         return LLAMA_RS_STATUS_OK;
     } catch (...) {
         return llama_rs_chat_current_exception(out_error);
@@ -828,101 +762,6 @@ extern "C" int llama_rs_fit_params(
     } catch (...) {
         return static_cast<int>(COMMON_PARAMS_FIT_STATUS_ERROR);
     }
-}
-
-extern "C" llama_rs_status llama_rs_context_memory_report_create(
-    const struct llama_context * context,
-    struct llama_rs_context_memory_report ** out_report,
-    char ** out_error) {
-    if (out_error) {
-        *out_error = nullptr;
-    }
-    if (out_report) {
-        *out_report = nullptr;
-    }
-    if (!context || !out_report) {
-        return llama_rs_chat_set_error(
-            out_error,
-            LLAMA_RS_STATUS_INVALID_ARGUMENT,
-            "context memory report arguments must not be null");
-    }
-
-    try {
-        auto report = llama_rs_context_memory_build(context);
-        *out_report = report.release();
-        return LLAMA_RS_STATUS_OK;
-    } catch (...) {
-        return llama_rs_chat_current_exception(out_error);
-    }
-}
-
-extern "C" void llama_rs_context_memory_report_free(
-    struct llama_rs_context_memory_report * report) {
-    delete report;
-}
-
-extern "C" size_t llama_rs_context_memory_report_device_count(
-    const struct llama_rs_context_memory_report * report) {
-    return report ? report->devices.size() : 0;
-}
-
-extern "C" llama_rs_status llama_rs_context_memory_report_device_get(
-    const struct llama_rs_context_memory_report * report,
-    size_t index,
-    struct llama_rs_context_device_memory * out_device,
-    char ** out_error) {
-    if (out_error) {
-        *out_error = nullptr;
-    }
-    if (!report || !out_device || index >= report->devices.size()) {
-        return llama_rs_chat_set_error(
-            out_error,
-            LLAMA_RS_STATUS_INVALID_ARGUMENT,
-            "context memory device index is out of range");
-    }
-
-    const auto & source = report->devices[index];
-    struct llama_rs_context_device_memory result = {};
-    result.has_device_index = source.has_device_index;
-    result.device_index = source.device_index;
-    result.backend_type = source.backend_type;
-    result.name = llama_rs_context_memory_view(source.name);
-    result.description = llama_rs_context_memory_view(source.description);
-    result.has_total_bytes = source.has_total_bytes;
-    result.total_bytes = source.total_bytes;
-    result.has_free_bytes = source.has_free_bytes;
-    result.free_bytes = source.free_bytes;
-    result.allocations = source.allocations;
-    *out_device = result;
-    return LLAMA_RS_STATUS_OK;
-}
-
-extern "C" size_t llama_rs_context_memory_report_other_count(
-    const struct llama_rs_context_memory_report * report) {
-    return report ? report->other_buffer_types.size() : 0;
-}
-
-extern "C" llama_rs_status llama_rs_context_memory_report_other_get(
-    const struct llama_rs_context_memory_report * report,
-    size_t index,
-    struct llama_rs_buffer_type_memory * out_buffer,
-    char ** out_error) {
-    if (out_error) {
-        *out_error = nullptr;
-    }
-    if (!report || !out_buffer || index >= report->other_buffer_types.size()) {
-        return llama_rs_chat_set_error(
-            out_error,
-            LLAMA_RS_STATUS_INVALID_ARGUMENT,
-            "context memory buffer type index is out of range");
-    }
-
-    const auto & source = report->other_buffer_types[index];
-    struct llama_rs_buffer_type_memory result = {};
-    result.name = llama_rs_context_memory_view(source.name);
-    result.allocations = source.allocations;
-    *out_buffer = result;
-    return LLAMA_RS_STATUS_OK;
 }
 
 extern "C" void llama_rs_memory_breakdown_print(const struct llama_context * ctx) {
