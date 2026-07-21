@@ -10,6 +10,12 @@ use crate::model::params::LlamaModelParams;
 
 use llama_cpp_sys_2 as sys;
 
+/// Stable identity of the native model-free ggml calibration procedure.
+pub const FIT_CALIBRATION_METHOD: &str = "llama-native-ggml-decode-calibration-v1";
+
+/// Stable identity of the native decode-workload projection.
+pub const FIT_DECODE_WORKLOAD_METHOD: &str = "llama-native-decode-workload-v1";
+
 /// Resolve the exact math-thread default from the pinned native common runtime.
 #[must_use]
 pub fn default_math_threads() -> u32 {
@@ -83,6 +89,164 @@ pub struct FitModelInfo {
     pub expert_count: u32,
     /// Exact tensor storage bytes reported by llama.cpp, independent of active experts.
     pub tensor_bytes: u64,
+}
+
+/// One model-free throughput calibration for a native backend operation.
+#[derive(Clone, Debug, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[cfg_attr(feature = "serde", serde(deny_unknown_fields))]
+pub struct FitCalibrationMetric {
+    /// Raw `ggml_backend_dev_type` value.
+    pub backend_type: i32,
+    /// Backend registration name.
+    pub backend: String,
+    /// Backend-reported physical device identity, when available.
+    pub device_id: Option<String>,
+    /// Raw `ggml_type` used by the synthetic weight tensor.
+    pub tensor_type: i32,
+    /// Whether the calibration used routed `MUL_MAT_ID` work.
+    pub routed: bool,
+    /// Effective weight bytes consumed per second by the operation.
+    pub bytes_per_second: f64,
+    /// Per-operation launch cost observed by native calibration.
+    pub launch_microseconds: f64,
+    /// Relative spread across the bounded calibration samples.
+    pub relative_spread: f64,
+}
+
+/// Serializable, model-free calibration of the enabled native backends.
+#[derive(Clone, Debug, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
+pub struct FitCalibration {
+    /// Stable identity of the native calibration procedure.
+    pub method: String,
+    /// Native calibration metrics keyed by device, tensor type, and operation class.
+    pub metrics: Vec<FitCalibrationMetric>,
+    /// Wall time spent in bounded synthetic backend operations.
+    pub elapsed_microseconds: u64,
+}
+
+#[cfg(feature = "serde")]
+impl<'de> serde::Deserialize<'de> for FitCalibration {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct WireCalibration {
+            method: String,
+            metrics: Vec<FitCalibrationMetric>,
+            elapsed_microseconds: u64,
+        }
+
+        let wire = WireCalibration::deserialize(deserializer)?;
+        let calibration = Self {
+            method: wire.method,
+            metrics: wire.metrics,
+            elapsed_microseconds: wire.elapsed_microseconds,
+        };
+        calibration.validate().map_err(serde::de::Error::custom)?;
+        Ok(calibration)
+    }
+}
+
+/// How llama.cpp uses one tensor during single-token decode.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+pub enum FitTensorWorkloadKind {
+    /// The complete tensor participates in every generated token.
+    AlwaysActive,
+    /// The tensor is a complete routed-expert pool; the caller chooses the active fraction.
+    RoutedExpert,
+    /// The tensor is accessed through a native row lookup.
+    RowLookup,
+}
+
+/// Native facts for one fitted model tensor.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
+pub struct FitTensorWorkload {
+    /// Canonical llama.cpp tensor name.
+    pub name: String,
+    /// Raw `ggml_backend_dev_type` of the fitted buffer device.
+    pub backend_type: i32,
+    /// Backend registration name.
+    pub backend: String,
+    /// Backend-reported physical device identity, when available.
+    pub device_id: Option<String>,
+    /// Raw tensor `ggml_type`.
+    pub tensor_type: i32,
+    /// Native access class.
+    pub kind: FitTensorWorkloadKind,
+    /// Complete tensor storage.
+    pub stored_bytes: u64,
+    /// Bytes touched by one operation before routed-expert selection is applied.
+    pub operation_bytes: u64,
+}
+
+/// Native KV facts for one fitted model layer.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
+pub struct FitKvLayerWorkload {
+    /// Zero-based transformer layer.
+    pub layer: u32,
+    /// Raw `ggml_backend_dev_type` of the fitted KV device.
+    pub backend_type: i32,
+    /// Backend registration name.
+    pub backend: String,
+    /// Backend-reported physical device identity, when available.
+    pub device_id: Option<String>,
+    /// Raw K-cache `ggml_type`.
+    pub key_type: i32,
+    /// Raw V-cache `ggml_type`.
+    pub value_type: i32,
+    /// Native K row bytes for one occupied token.
+    pub key_bytes_per_token: u64,
+    /// Native V row bytes for one occupied token.
+    pub value_bytes_per_token: u64,
+    /// Sliding-window cap, or zero for full attention.
+    pub sliding_window_tokens: u32,
+    /// Whether this layer is recurrent.
+    pub recurrent: bool,
+}
+
+/// Native decode facts attached to a fitted no-allocation model.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
+pub struct FitDecodeWorkload {
+    /// Stable native workload schema identity.
+    pub method: String,
+    /// Total routed experts declared by the model.
+    pub expert_count: u32,
+    /// Routed experts selected for one token.
+    pub expert_used_count: u32,
+    /// Whether the model mixes native layer architectures.
+    pub hybrid_model: bool,
+    /// Whether the model contains recurrent execution.
+    pub recurrent_model: bool,
+    /// Exact fitted tensor facts.
+    pub tensors: Vec<FitTensorWorkload>,
+    /// Exact per-layer KV facts.
+    pub kv_layers: Vec<FitKvLayerWorkload>,
+}
+
+/// Availability of native decode facts. This type intentionally contains no speed formula.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
+#[cfg_attr(feature = "serde", serde(tag = "status", rename_all = "snake_case"))]
+pub enum FitDecodeWorkloadAssessment {
+    /// Native workload extraction succeeded.
+    Available {
+        /// Exact native decode facts.
+        workload: FitDecodeWorkload,
+    },
+    /// Workload extraction was not requested or could not be completed.
+    Unavailable {
+        /// Native diagnostic or the explicit not-requested reason.
+        reason: String,
+    },
 }
 
 /// Allocation classes reported by llama.cpp's graph planner.
@@ -174,16 +338,16 @@ impl FitDeviceEstimate {
     #[must_use]
     pub fn backend_device_type(&self) -> crate::LlamaBackendDeviceType {
         match self.backend_type {
-            value if value == sys::GGML_BACKEND_DEVICE_TYPE_CPU as i32 => {
+            value if value == sys::GGML_BACKEND_DEVICE_TYPE_CPU.cast_signed() => {
                 crate::LlamaBackendDeviceType::Cpu
             }
-            value if value == sys::GGML_BACKEND_DEVICE_TYPE_ACCEL as i32 => {
+            value if value == sys::GGML_BACKEND_DEVICE_TYPE_ACCEL.cast_signed() => {
                 crate::LlamaBackendDeviceType::Accelerator
             }
-            value if value == sys::GGML_BACKEND_DEVICE_TYPE_GPU as i32 => {
+            value if value == sys::GGML_BACKEND_DEVICE_TYPE_GPU.cast_signed() => {
                 crate::LlamaBackendDeviceType::Gpu
             }
-            value if value == sys::GGML_BACKEND_DEVICE_TYPE_IGPU as i32 => {
+            value if value == sys::GGML_BACKEND_DEVICE_TYPE_IGPU.cast_signed() => {
                 crate::LlamaBackendDeviceType::IntegratedGpu
             }
             _ => crate::LlamaBackendDeviceType::Unknown,
@@ -359,6 +523,18 @@ pub enum FitReportError {
         /// Stable DTO field being decoded.
         field: &'static str,
     },
+    /// A native or deserialized calibration value was outside its numeric domain.
+    #[error("llama.cpp fit calibration field {field} is outside its numeric domain")]
+    InvalidCalibrationNumber {
+        /// Stable DTO field containing the invalid value.
+        field: &'static str,
+    },
+    /// A deserialized calibration identity is empty or contains an embedded terminator.
+    #[error("fit calibration field {field} contains an invalid identity")]
+    InvalidCalibrationString {
+        /// Stable DTO field containing the invalid string.
+        field: &'static str,
+    },
 }
 
 /// Typed, stable projection of llama.cpp `common/fit` and its memory diagnostics.
@@ -387,6 +563,8 @@ pub struct FitReport {
     pub adjustments: Vec<FitAdjustment>,
     /// Typed caveats, deficits, and failures.
     pub warnings: Vec<FitWarning>,
+    /// Native decode facts for the effective fitted plan.
+    pub decode_workload: FitDecodeWorkloadAssessment,
     /// Wall time for initial measurement, fitting, and fitted measurement.
     pub elapsed_microseconds: u64,
 }
@@ -400,6 +578,8 @@ impl FitReport {
 }
 
 struct NativeFitReport(NonNull<sys::llama_rs_fit_report>);
+
+struct NativeFitCalibration(NonNull<sys::llama_rs_fit_calibration>);
 
 /// A no-allocation target model/context kept alive while fitting a linked MTP context.
 #[derive(Debug)]
@@ -418,16 +598,164 @@ impl Drop for NativeFitReport {
     }
 }
 
+impl Drop for NativeFitCalibration {
+    fn drop(&mut self) {
+        unsafe { sys::llama_rs_fit_calibration_free(self.0.as_ptr()) };
+    }
+}
+
+impl FitCalibration {
+    /// Run bounded model-free calibration against the initialized native backend registry.
+    ///
+    /// No model is loaded and no token decode is performed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FitReportError`] when native calibration fails or returns malformed evidence.
+    pub fn measure(_backend: &crate::llama_backend::LlamaBackend) -> Result<Self, FitReportError> {
+        let _logger_guard = crate::log::lock_native_logger();
+        let mut native = ptr::null_mut();
+        let mut native_error: *mut c_char = ptr::null_mut();
+        let status =
+            unsafe { sys::llama_rs_fit_calibration_create(&raw mut native, &raw mut native_error) };
+        if status != sys::LLAMA_RS_STATUS_OK {
+            return Err(FitReportError::Native {
+                status,
+                message: take_native_error(native_error),
+            });
+        }
+        if !native_error.is_null() {
+            unsafe { sys::llama_rs_string_free(native_error) };
+        }
+        let native = NativeFitCalibration(
+            NonNull::new(native).ok_or(FitReportError::Malformed("null calibration"))?,
+        );
+        let metric_count = unsafe { sys::llama_rs_fit_calibration_metric_count(native.0.as_ptr()) };
+        let mut metrics = Vec::new();
+        metrics
+            .try_reserve_exact(metric_count)
+            .map_err(|_| FitReportError::RustAllocation {
+                collection: "calibration metrics",
+                requested: metric_count,
+            })?;
+        for index in 0..metric_count {
+            let mut raw = MaybeUninit::<sys::llama_rs_fit_calibration_metric>::uninit();
+            if !unsafe {
+                sys::llama_rs_fit_calibration_get_metric(native.0.as_ptr(), index, raw.as_mut_ptr())
+            } {
+                return Err(FitReportError::Malformed("missing calibration metric"));
+            }
+            let raw = unsafe { raw.assume_init() };
+            validate_positive_finite(raw.bytes_per_second, "calibration.bytes_per_second")?;
+            validate_nonnegative_finite(
+                raw.launch_microseconds,
+                "calibration.launch_microseconds",
+            )?;
+            validate_nonnegative_finite(raw.relative_spread, "calibration.relative_spread")?;
+            metrics.push(FitCalibrationMetric {
+                backend_type: raw.backend_type,
+                backend: borrowed_string(raw.backend, "calibration.backend")?,
+                device_id: optional_borrowed_string(raw.device_id, "calibration.device_id")?,
+                tensor_type: raw.tensor_type,
+                routed: raw.routed,
+                bytes_per_second: raw.bytes_per_second,
+                launch_microseconds: raw.launch_microseconds,
+                relative_spread: raw.relative_spread,
+            });
+        }
+        let elapsed =
+            unsafe { sys::llama_rs_fit_calibration_elapsed_microseconds(native.0.as_ptr()) };
+        let method = borrowed_string(
+            unsafe { sys::llama_rs_fit_calibration_method(native.0.as_ptr()) },
+            "calibration.method",
+        )?;
+        let calibration = Self {
+            method,
+            metrics,
+            elapsed_microseconds: elapsed.max(0).cast_unsigned(),
+        };
+        calibration.validate()?;
+        Ok(calibration)
+    }
+
+    fn validate(&self) -> Result<(), FitReportError> {
+        if self.method != FIT_CALIBRATION_METHOD {
+            return Err(FitReportError::Malformed(
+                "calibration method does not match the native calibration schema",
+            ));
+        }
+        if self.metrics.is_empty() {
+            return Err(FitReportError::Malformed("calibration has no metrics"));
+        }
+        for metric in &self.metrics {
+            validate_positive_finite(metric.bytes_per_second, "calibration.bytes_per_second")?;
+            validate_nonnegative_finite(
+                metric.launch_microseconds,
+                "calibration.launch_microseconds",
+            )?;
+            validate_nonnegative_finite(metric.relative_spread, "calibration.relative_spread")?;
+            if metric.backend.is_empty() || metric.backend.as_bytes().contains(&0) {
+                return Err(FitReportError::InvalidCalibrationString {
+                    field: "calibration.backend",
+                });
+            }
+            if metric
+                .device_id
+                .as_ref()
+                .is_some_and(|value| value.is_empty() || value.as_bytes().contains(&0))
+            {
+                return Err(FitReportError::InvalidCalibrationString {
+                    field: "calibration.device_id",
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
 impl LlamaModelParams {
     /// Measure several execution contexts while constructing the no-allocation model once.
     ///
     /// This is an exact projection of llama.cpp model/context graphs. It does not run
     /// `common_fit_params` or alter the supplied parameters.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FitReportError`] for invalid buffers, native inspection failures, or malformed
+    /// bridge results.
     pub fn measure_contexts(
         &self,
         model_path: &CStr,
         contexts: &[LlamaContextParams],
         margins: &[usize],
+    ) -> Result<Vec<FitReport>, FitReportError> {
+        self.measure_contexts_impl(model_path, contexts, margins, false)
+    }
+
+    /// Measure contexts and attach native decode-workload facts.
+    ///
+    /// The no-allocation model is constructed once for all contexts. This method performs no
+    /// throughput calculation and does not run a model decode.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FitReportError`] for invalid buffers, native inspection failures, or malformed
+    /// bridge results.
+    pub fn measure_contexts_with_decode_workload(
+        &self,
+        model_path: &CStr,
+        contexts: &[LlamaContextParams],
+        margins: &[usize],
+    ) -> Result<Vec<FitReport>, FitReportError> {
+        self.measure_contexts_impl(model_path, contexts, margins, true)
+    }
+
+    fn measure_contexts_impl(
+        &self,
+        model_path: &CStr,
+        contexts: &[LlamaContextParams],
+        margins: &[usize],
+        capture_decode_workload: bool,
     ) -> Result<Vec<FitReport>, FitReportError> {
         let _logger_guard = crate::log::lock_native_logger();
         let max_devices = unsafe { sys::llama_max_devices() };
@@ -451,6 +779,7 @@ impl LlamaModelParams {
                 raw_contexts.len(),
                 margins.as_ptr(),
                 margins.len(),
+                capture_decode_workload,
                 sys::GGML_LOG_LEVEL_ERROR,
                 raw_reports.as_mut_ptr(),
                 &raw mut native_error,
@@ -503,13 +832,34 @@ impl LlamaModelParams {
         margins: &mut [usize],
         n_ctx_min: u32,
     ) -> Result<FitReport, FitReportError> {
-        self.fit_params_report_impl(model_path, cparams, None, margins, n_ctx_min)
+        self.fit_params_report_impl(model_path, cparams, None, margins, n_ctx_min, false)
+    }
+
+    /// Fit unset parameters and attach native decode-workload facts.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FitReportError`] for invalid buffers, native fit failures, or a malformed bridge
+    /// result.
+    pub fn fit_params_report_with_decode_workload(
+        self: Pin<&mut Self>,
+        model_path: &CStr,
+        cparams: &mut LlamaContextParams,
+        margins: &mut [usize],
+        n_ctx_min: u32,
+    ) -> Result<FitReport, FitReportError> {
+        self.fit_params_report_impl(model_path, cparams, None, margins, n_ctx_min, true)
     }
 
     /// Fit an MTP model/context while a no-allocation target context is linked as `ctx_other`.
     ///
     /// The returned report contains only the fitted model/context allocations. Compose it with a
     /// separate target report to assess the full execution plan.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FitReportError`] for invalid buffers, native fit failures, or a malformed bridge
+    /// result.
     pub fn fit_params_report_linked(
         self: Pin<&mut Self>,
         model_path: &CStr,
@@ -518,7 +868,7 @@ impl LlamaModelParams {
         margins: &mut [usize],
         n_ctx_min: u32,
     ) -> Result<FitReport, FitReportError> {
-        self.fit_params_report_impl(model_path, cparams, Some(target), margins, n_ctx_min)
+        self.fit_params_report_impl(model_path, cparams, Some(target), margins, n_ctx_min, false)
     }
 
     fn fit_params_report_impl(
@@ -528,6 +878,7 @@ impl LlamaModelParams {
         linked_target: Option<LinkedFitTarget<'_>>,
         margins: &mut [usize],
         n_ctx_min: u32,
+        capture_decode_workload: bool,
     ) -> Result<FitReport, FitReportError> {
         let _logger_guard = crate::log::lock_native_logger();
         let max_devices = unsafe { sys::llama_max_devices() };
@@ -570,6 +921,7 @@ impl LlamaModelParams {
                     self.buft_overrides.as_mut_ptr(),
                     margins.as_mut_ptr(),
                     margins.len(),
+                    capture_decode_workload,
                     n_ctx_min,
                     sys::GGML_LOG_LEVEL_ERROR,
                     &raw mut native_report,
@@ -583,6 +935,7 @@ impl LlamaModelParams {
                     self.buft_overrides.as_mut_ptr(),
                     margins.as_mut_ptr(),
                     margins.len(),
+                    capture_decode_workload,
                     n_ctx_min,
                     sys::GGML_LOG_LEVEL_ERROR,
                     &raw mut native_report,
@@ -697,6 +1050,7 @@ fn decode_report(native: &NativeFitReport) -> Result<FitReport, FitReportError> 
             .ok_or(FitReportError::ArithmeticOverflow {
                 field: "offloadable layer count",
             })?;
+    let decode_workload = decode_workload(native)?;
 
     Ok(FitReport {
         status,
@@ -714,7 +1068,145 @@ fn decode_report(native: &NativeFitReport) -> Result<FitReport, FitReportError> 
         tensor_placements: placements,
         adjustments,
         warnings,
+        decode_workload,
         elapsed_microseconds: summary.elapsed_microseconds.max(0).cast_unsigned(),
+    })
+}
+
+fn decode_workload(
+    native: &NativeFitReport,
+) -> Result<FitDecodeWorkloadAssessment, FitReportError> {
+    let mut raw = MaybeUninit::<sys::llama_rs_fit_decode_workload_summary>::uninit();
+    if !unsafe {
+        sys::llama_rs_fit_report_get_decode_workload_summary(native.0.as_ptr(), raw.as_mut_ptr())
+    } {
+        return Err(FitReportError::Malformed("missing decode workload summary"));
+    }
+    let raw = unsafe { raw.assume_init() };
+    if !raw.available {
+        return Ok(FitDecodeWorkloadAssessment::Unavailable {
+            reason: borrowed_string(raw.unavailable_reason, "decode_workload.unavailable_reason")?,
+        });
+    }
+    let method = borrowed_string(raw.method, "decode_workload.method")?;
+    if method != FIT_DECODE_WORKLOAD_METHOD {
+        return Err(FitReportError::Malformed(
+            "decode workload method does not match the native schema",
+        ));
+    }
+
+    let tensor_count = unsafe { sys::llama_rs_fit_report_tensor_workload_count(native.0.as_ptr()) };
+    if tensor_count == 0 {
+        return Err(FitReportError::Malformed("decode workload has no tensors"));
+    }
+    let mut tensors = Vec::new();
+    tensors
+        .try_reserve_exact(tensor_count)
+        .map_err(|_| FitReportError::RustAllocation {
+            collection: "decode workload tensors",
+            requested: tensor_count,
+        })?;
+    for index in 0..tensor_count {
+        tensors.push(decode_tensor_workload(native, index)?);
+    }
+
+    let layer_count =
+        unsafe { sys::llama_rs_fit_report_kv_layer_workload_count(native.0.as_ptr()) };
+    let mut kv_layers = Vec::new();
+    kv_layers
+        .try_reserve_exact(layer_count)
+        .map_err(|_| FitReportError::RustAllocation {
+            collection: "decode workload KV layers",
+            requested: layer_count,
+        })?;
+    for index in 0..layer_count {
+        kv_layers.push(decode_kv_layer_workload(native, index)?);
+    }
+
+    Ok(FitDecodeWorkloadAssessment::Available {
+        workload: FitDecodeWorkload {
+            method,
+            expert_count: raw.expert_count,
+            expert_used_count: raw.expert_used_count,
+            hybrid_model: raw.hybrid_model,
+            recurrent_model: raw.recurrent_model,
+            tensors,
+            kv_layers,
+        },
+    })
+}
+
+fn decode_tensor_workload(
+    native: &NativeFitReport,
+    index: usize,
+) -> Result<FitTensorWorkload, FitReportError> {
+    let mut raw = MaybeUninit::<sys::llama_rs_fit_tensor_workload>::uninit();
+    if !unsafe {
+        sys::llama_rs_fit_report_get_tensor_workload(native.0.as_ptr(), index, raw.as_mut_ptr())
+    } {
+        return Err(FitReportError::Malformed("missing decode tensor workload"));
+    }
+    let raw = unsafe { raw.assume_init() };
+    let kind = match raw.kind {
+        sys::LLAMA_RS_FIT_TENSOR_ALWAYS_ACTIVE => FitTensorWorkloadKind::AlwaysActive,
+        sys::LLAMA_RS_FIT_TENSOR_ROUTED_EXPERT => FitTensorWorkloadKind::RoutedExpert,
+        sys::LLAMA_RS_FIT_TENSOR_ROW_LOOKUP => FitTensorWorkloadKind::RowLookup,
+        value => {
+            return Err(FitReportError::UnknownEnum {
+                kind: "fit tensor workload kind",
+                value: value.cast_signed(),
+            });
+        }
+    };
+    if raw.stored_bytes == 0 || raw.operation_bytes == 0 || raw.operation_bytes > raw.stored_bytes {
+        return Err(FitReportError::Malformed(
+            "decode tensor workload has invalid byte counts",
+        ));
+    }
+    Ok(FitTensorWorkload {
+        name: borrowed_string(raw.name, "decode_workload.tensors[].name")?,
+        backend_type: raw.backend_type,
+        backend: borrowed_string(raw.backend, "decode_workload.tensors[].backend")?,
+        device_id: optional_borrowed_string(raw.device_id, "decode_workload.tensors[].device_id")?,
+        tensor_type: raw.tensor_type,
+        kind,
+        stored_bytes: raw.stored_bytes,
+        operation_bytes: raw.operation_bytes,
+    })
+}
+
+fn decode_kv_layer_workload(
+    native: &NativeFitReport,
+    index: usize,
+) -> Result<FitKvLayerWorkload, FitReportError> {
+    let mut raw = MaybeUninit::<sys::llama_rs_fit_kv_layer_workload>::uninit();
+    if !unsafe {
+        sys::llama_rs_fit_report_get_kv_layer_workload(native.0.as_ptr(), index, raw.as_mut_ptr())
+    } {
+        return Err(FitReportError::Malformed(
+            "missing decode KV layer workload",
+        ));
+    }
+    let raw = unsafe { raw.assume_init() };
+    if raw.key_bytes_per_token == 0 || raw.value_bytes_per_token == 0 {
+        return Err(FitReportError::Malformed(
+            "decode KV layer workload has zero row bytes",
+        ));
+    }
+    Ok(FitKvLayerWorkload {
+        layer: raw.layer,
+        backend_type: raw.backend_type,
+        backend: borrowed_string(raw.backend, "decode_workload.kv_layers[].backend")?,
+        device_id: optional_borrowed_string(
+            raw.device_id,
+            "decode_workload.kv_layers[].device_id",
+        )?,
+        key_type: raw.key_type,
+        value_type: raw.value_type,
+        key_bytes_per_token: raw.key_bytes_per_token,
+        value_bytes_per_token: raw.value_bytes_per_token,
+        sliding_window_tokens: raw.sliding_window_tokens,
+        recurrent: raw.recurrent,
     })
 }
 
@@ -977,6 +1469,22 @@ fn nonzero_option(value: u32) -> Option<u32> {
     (value != 0).then_some(value)
 }
 
+fn validate_positive_finite(value: f64, field: &'static str) -> Result<(), FitReportError> {
+    if value.is_finite() && value > 0.0 {
+        Ok(())
+    } else {
+        Err(FitReportError::InvalidCalibrationNumber { field })
+    }
+}
+
+fn validate_nonnegative_finite(value: f64, field: &'static str) -> Result<(), FitReportError> {
+    if value.is_finite() && value >= 0.0 {
+        Ok(())
+    } else {
+        Err(FitReportError::InvalidCalibrationNumber { field })
+    }
+}
+
 fn borrowed_string(value: *const c_char, field: &'static str) -> Result<String, FitReportError> {
     optional_borrowed_string(value, field)?.ok_or(FitReportError::MissingString { field })
 }
@@ -1117,5 +1625,66 @@ mod tests {
             borrowed_string(invalid.as_ptr().cast(), "name"),
             Err(FitReportError::InvalidUtf8 { field: "name" })
         ));
+    }
+
+    #[test]
+    fn calibration_projection_rejects_invalid_rates_and_identities() {
+        let invalid_rate = FitCalibration {
+            method: FIT_CALIBRATION_METHOD.to_owned(),
+            metrics: vec![FitCalibrationMetric {
+                backend_type: 1,
+                backend: "CPU".to_owned(),
+                device_id: None,
+                tensor_type: 1,
+                routed: false,
+                bytes_per_second: f64::NAN,
+                launch_microseconds: 0.0,
+                relative_spread: 0.0,
+            }],
+            elapsed_microseconds: 1,
+        };
+        assert!(matches!(
+            invalid_rate.validate(),
+            Err(FitReportError::InvalidCalibrationNumber {
+                field: "calibration.bytes_per_second"
+            })
+        ));
+
+        let invalid_identity = FitCalibration {
+            method: FIT_CALIBRATION_METHOD.to_owned(),
+            metrics: vec![FitCalibrationMetric {
+                bytes_per_second: 1.0,
+                backend: "CPU\0unexpected".to_owned(),
+                ..invalid_rate.metrics[0].clone()
+            }],
+            elapsed_microseconds: 1,
+        };
+        assert!(matches!(
+            invalid_identity.validate(),
+            Err(FitReportError::InvalidCalibrationString {
+                field: "calibration.backend"
+            })
+        ));
+    }
+
+    #[test]
+    #[ignore = "runs bounded synthetic backend calibration"]
+    fn native_calibration_is_model_free_finite_and_bounded() {
+        let backend = crate::llama_backend::LlamaBackend::init()
+            .expect("initialize native backend for synthetic calibration");
+        let calibration =
+            FitCalibration::measure(&backend).expect("run model-free synthetic calibration");
+        assert_eq!(calibration.method, FIT_CALIBRATION_METHOD);
+        assert!(!calibration.metrics.is_empty());
+        assert!(calibration.elapsed_microseconds > 0);
+        assert!(calibration.elapsed_microseconds <= 120_000_000);
+        assert!(calibration.metrics.iter().any(|metric| !metric.routed));
+        assert!(calibration.metrics.iter().any(|metric| metric.routed));
+        for metric in calibration.metrics {
+            assert!(!metric.backend.is_empty());
+            assert!(metric.bytes_per_second.is_finite() && metric.bytes_per_second > 0.0);
+            assert!(metric.launch_microseconds.is_finite() && metric.launch_microseconds >= 0.0);
+            assert!(metric.relative_spread.is_finite() && metric.relative_spread >= 0.0);
+        }
     }
 }

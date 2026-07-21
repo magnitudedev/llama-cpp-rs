@@ -8,6 +8,7 @@
 #include <stdint.h>
 
 struct llama_rs_fit_report;
+struct llama_rs_fit_calibration;
 
 #ifdef __cplusplus
 extern "C" {
@@ -49,6 +50,12 @@ typedef enum llama_rs_fit_placement_kind {
     LLAMA_RS_FIT_PLACEMENT_OTHER = 2,
 } llama_rs_fit_placement_kind;
 
+typedef enum llama_rs_fit_tensor_workload_kind {
+    LLAMA_RS_FIT_TENSOR_ALWAYS_ACTIVE = 0,
+    LLAMA_RS_FIT_TENSOR_ROUTED_EXPERT = 1,
+    LLAMA_RS_FIT_TENSOR_ROW_LOOKUP = 2,
+} llama_rs_fit_tensor_workload_kind;
+
 typedef struct llama_rs_fit_memory {
     int64_t total_bytes;
     int64_t free_bytes;
@@ -77,6 +84,74 @@ typedef struct llama_rs_fit_summary {
     int64_t elapsed_microseconds;
 } llama_rs_fit_summary;
 
+typedef struct llama_rs_fit_calibration_metric {
+    int32_t backend_type;
+    const char * backend;
+    const char * device_id;
+    int32_t tensor_type;
+    bool routed;
+    double bytes_per_second;
+    double launch_microseconds;
+    double relative_spread;
+} llama_rs_fit_calibration_metric;
+
+typedef struct llama_rs_fit_decode_workload_summary {
+    bool available;
+    const char * method;
+    const char * unavailable_reason;
+    uint32_t expert_count;
+    uint32_t expert_used_count;
+    bool hybrid_model;
+    bool recurrent_model;
+} llama_rs_fit_decode_workload_summary;
+
+typedef struct llama_rs_fit_tensor_workload {
+    const char * name;
+    int32_t backend_type;
+    const char * backend;
+    const char * device_id;
+    int32_t tensor_type;
+    enum llama_rs_fit_tensor_workload_kind kind;
+    uint64_t stored_bytes;
+    uint64_t operation_bytes;
+} llama_rs_fit_tensor_workload;
+
+typedef struct llama_rs_fit_kv_layer_workload {
+    uint32_t layer;
+    int32_t backend_type;
+    const char * backend;
+    const char * device_id;
+    int32_t key_type;
+    int32_t value_type;
+    uint64_t key_bytes_per_token;
+    uint64_t value_bytes_per_token;
+    uint32_t sliding_window_tokens;
+    bool recurrent;
+} llama_rs_fit_kv_layer_workload;
+
+// Runs bounded, model-free ggml backend calibration. No model is loaded and no
+// token decode is performed. The returned values can be serialized and passed
+// to isolated planner processes.
+llama_rs_status llama_rs_fit_calibration_create(
+    struct llama_rs_fit_calibration ** out_calibration,
+    char ** out_error);
+
+void llama_rs_fit_calibration_free(struct llama_rs_fit_calibration * calibration);
+
+int64_t llama_rs_fit_calibration_elapsed_microseconds(
+    const struct llama_rs_fit_calibration * calibration);
+
+const char * llama_rs_fit_calibration_method(
+    const struct llama_rs_fit_calibration * calibration);
+
+size_t llama_rs_fit_calibration_metric_count(
+    const struct llama_rs_fit_calibration * calibration);
+
+bool llama_rs_fit_calibration_get_metric(
+    const struct llama_rs_fit_calibration * calibration,
+    size_t index,
+    struct llama_rs_fit_calibration_metric * out_metric);
+
 // Measures several contexts against one no-allocation model construction. Each
 // returned report contains an initial measurement only; no fitting is run.
 llama_rs_status llama_rs_fit_measure_reports_create(
@@ -86,6 +161,7 @@ llama_rs_status llama_rs_fit_measure_reports_create(
     size_t profile_count,
     const size_t * margins,
     size_t margins_count,
+    bool capture_decode_workload,
     enum ggml_log_level log_level,
     struct llama_rs_fit_report ** out_reports,
     char ** out_error);
@@ -126,6 +202,7 @@ llama_rs_status llama_rs_fit_report_create(
     struct llama_model_tensor_buft_override * tensor_buft_overrides,
     size_t * margins,
     size_t margins_count,
+    bool capture_decode_workload,
     uint32_t n_ctx_min,
     enum ggml_log_level log_level,
     struct llama_rs_fit_report ** out_report,
@@ -145,6 +222,7 @@ llama_rs_status llama_rs_fit_report_create_linked(
     struct llama_model_tensor_buft_override * tensor_buft_overrides,
     size_t * margins,
     size_t margins_count,
+    bool capture_decode_workload,
     uint32_t n_ctx_min,
     enum ggml_log_level log_level,
     struct llama_rs_fit_report ** out_report,
@@ -176,6 +254,26 @@ bool llama_rs_fit_report_get_placement(
     const struct llama_rs_fit_report * report,
     size_t index,
     struct llama_rs_fit_placement * out_placement);
+
+bool llama_rs_fit_report_get_decode_workload_summary(
+    const struct llama_rs_fit_report * report,
+    struct llama_rs_fit_decode_workload_summary * out_summary);
+
+size_t llama_rs_fit_report_tensor_workload_count(
+    const struct llama_rs_fit_report * report);
+
+bool llama_rs_fit_report_get_tensor_workload(
+    const struct llama_rs_fit_report * report,
+    size_t index,
+    struct llama_rs_fit_tensor_workload * out_tensor);
+
+size_t llama_rs_fit_report_kv_layer_workload_count(
+    const struct llama_rs_fit_report * report);
+
+bool llama_rs_fit_report_get_kv_layer_workload(
+    const struct llama_rs_fit_report * report,
+    size_t index,
+    struct llama_rs_fit_kv_layer_workload * out_layer);
 
 void llama_rs_memory_breakdown_print(const struct llama_context * ctx);
 
