@@ -1,5 +1,7 @@
 //! Safe wrapper around `llama_context`.
 
+#[cfg(feature = "common")]
+use std::ffi::CStr;
 use std::fmt::{Debug, Formatter};
 use std::num::NonZeroI32;
 use std::ops::{Deref, DerefMut};
@@ -34,6 +36,66 @@ pub struct LlamaContext<'a> {
     initialized_logits: Vec<i32>,
     embeddings_enabled: bool,
     abort_callback: Option<Arc<AtomicBool>>,
+}
+
+/// Physical memory location reported by llama.cpp for a resident allocation.
+#[cfg(feature = "common")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum LlamaMemoryLocation {
+    /// Host memory.
+    Host,
+    /// Memory owned by one registered backend device.
+    Device {
+        /// Normalized backend name.
+        backend: String,
+        /// Backend-provided physical device identity, when available.
+        physical_id: Option<String>,
+        /// Index in llama.cpp's registered backend-device list.
+        native_index: usize,
+    },
+}
+
+/// Resident bytes attributed by llama.cpp to one physical memory location.
+#[cfg(feature = "common")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LlamaMemoryBreakdown {
+    /// Physical allocation location.
+    pub location: LlamaMemoryLocation,
+    /// Model allocation bytes.
+    pub model_bytes: u64,
+    /// Context and KV allocation bytes.
+    pub context_bytes: u64,
+    /// Compute workspace allocation bytes.
+    pub compute_bytes: u64,
+}
+
+/// Failure to obtain a typed resident-memory report from llama.cpp.
+#[cfg(feature = "common")]
+#[derive(Debug, thiserror::Error)]
+pub enum LlamaMemoryBreakdownError {
+    /// The native bridge rejected the capture operation.
+    #[error("llama.cpp resident-memory bridge failed with status {status}: {message}")]
+    Native {
+        /// Raw `llama_rs_status` value.
+        status: i32,
+        /// Native diagnostic.
+        message: String,
+    },
+    /// A successful native call returned no report.
+    #[error("llama.cpp returned a null resident-memory report")]
+    NullReport,
+    /// Rust could not reserve space for the native report entries.
+    #[error("could not reserve {requested} resident-memory entries")]
+    RustAllocation {
+        /// Native-reported entry count.
+        requested: usize,
+    },
+    /// A report entry could not be read.
+    #[error("llama.cpp returned an invalid resident-memory entry at index {0}")]
+    InvalidEntry(usize),
+    /// The report contained a location kind unknown to this binding.
+    #[error("llama.cpp returned an unknown resident-memory location {0}")]
+    UnknownLocation(u32),
 }
 
 /// A thread-safe cancellation handle for an installed llama.cpp abort callback.
@@ -607,6 +669,91 @@ impl<'model> LlamaContext<'model> {
     #[cfg(feature = "common")]
     pub fn print_memory_breakdown(&self) {
         unsafe { llama_cpp_sys_2::llama_rs_memory_breakdown_print(self.context.as_ptr()) }
+    }
+
+    /// Return llama.cpp's resident model, context, and compute allocations by physical location.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if llama.cpp cannot construct or decode the typed report.
+    #[cfg(feature = "common")]
+    pub fn memory_breakdown(&self) -> Result<Vec<LlamaMemoryBreakdown>, LlamaMemoryBreakdownError> {
+        struct Report(NonNull<llama_cpp_sys_2::llama_rs_memory_breakdown_report>);
+        impl Drop for Report {
+            fn drop(&mut self) {
+                unsafe { llama_cpp_sys_2::llama_rs_memory_breakdown_free(self.0.as_ptr()) }
+            }
+        }
+
+        fn text(value: *const std::os::raw::c_char) -> String {
+            if value.is_null() {
+                return String::new();
+            }
+            unsafe { CStr::from_ptr(value) }
+                .to_string_lossy()
+                .into_owned()
+        }
+
+        let mut raw_report = std::ptr::null_mut();
+        let mut raw_error = std::ptr::null_mut();
+        let status = unsafe {
+            llama_cpp_sys_2::llama_rs_memory_breakdown_create(
+                self.context.as_ptr(),
+                &raw mut raw_report,
+                &raw mut raw_error,
+            )
+        };
+        if status != llama_cpp_sys_2::LLAMA_RS_STATUS_OK {
+            let message = if raw_error.is_null() {
+                String::new()
+            } else {
+                let message = unsafe { CStr::from_ptr(raw_error) }
+                    .to_string_lossy()
+                    .into_owned();
+                unsafe { llama_cpp_sys_2::llama_rs_string_free(raw_error) };
+                message
+            };
+            return Err(LlamaMemoryBreakdownError::Native { status, message });
+        }
+        if !raw_error.is_null() {
+            unsafe { llama_cpp_sys_2::llama_rs_string_free(raw_error) };
+        }
+        let report = Report(NonNull::new(raw_report).ok_or(LlamaMemoryBreakdownError::NullReport)?);
+        let count = unsafe { llama_cpp_sys_2::llama_rs_memory_breakdown_count(report.0.as_ptr()) };
+        let mut result = Vec::new();
+        result
+            .try_reserve_exact(count)
+            .map_err(|_| LlamaMemoryBreakdownError::RustAllocation { requested: count })?;
+        for index in 0..count {
+            let mut entry =
+                std::mem::MaybeUninit::<llama_cpp_sys_2::llama_rs_memory_breakdown_entry>::uninit();
+            if !unsafe {
+                llama_cpp_sys_2::llama_rs_memory_breakdown_get(
+                    report.0.as_ptr(),
+                    index,
+                    entry.as_mut_ptr(),
+                )
+            } {
+                return Err(LlamaMemoryBreakdownError::InvalidEntry(index));
+            }
+            let entry = unsafe { entry.assume_init() };
+            let location = match entry.location {
+                llama_cpp_sys_2::LLAMA_RS_MEMORY_LOCATION_HOST => LlamaMemoryLocation::Host,
+                llama_cpp_sys_2::LLAMA_RS_MEMORY_LOCATION_DEVICE => LlamaMemoryLocation::Device {
+                    backend: text(entry.backend),
+                    physical_id: (!entry.device_id.is_null()).then(|| text(entry.device_id)),
+                    native_index: entry.native_index,
+                },
+                other => return Err(LlamaMemoryBreakdownError::UnknownLocation(other)),
+            };
+            result.push(LlamaMemoryBreakdown {
+                location,
+                model_bytes: entry.model_bytes,
+                context_bytes: entry.context_bytes,
+                compute_bytes: entry.compute_bytes,
+            });
+        }
+        Ok(result)
     }
 }
 

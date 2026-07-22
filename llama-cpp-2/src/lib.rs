@@ -152,23 +152,35 @@ pub enum DecodeError {
     /// Native execution was interrupted by the configured abort callback.
     #[error("Decode Error 2: Aborted")]
     Aborted,
-    /// The number of tokens in the batch was 0.
-    #[error("Decode Error -1: n_tokens == 0")]
-    NTokensZero,
+    /// The input batch was invalid.
+    #[error("Decode Error -1: invalid input batch")]
+    InvalidInputBatch,
+    /// Native graph allocation failed.
+    #[error("Decode Error -2: graph allocation failed")]
+    AllocationFailed,
+    /// Native graph execution failed.
+    #[error("Decode Error -3: graph execution failed")]
+    GraphExecutionFailed,
     /// An unknown error occurred.
     #[error("Decode Error {0}: unknown")]
     Unknown(c_int),
 }
 
-/// Failed to decode a batch.
+/// Failed to encode a batch.
 #[derive(Debug, Eq, PartialEq, thiserror::Error)]
 pub enum EncodeError {
-    /// No kv cache slot was available.
-    #[error("Encode Error 1: NoKvCacheSlot")]
-    NoKvCacheSlot,
-    /// The number of tokens in the batch was 0.
-    #[error("Encode Error -1: n_tokens == 0")]
-    NTokensZero,
+    /// Native execution was interrupted by the configured abort callback.
+    #[error("Encode Error 2: Aborted")]
+    Aborted,
+    /// The input batch was invalid.
+    #[error("Encode Error -1: invalid input batch")]
+    InvalidInputBatch,
+    /// Native graph allocation failed.
+    #[error("Encode Error -2: graph allocation failed")]
+    AllocationFailed,
+    /// Native graph execution failed.
+    #[error("Encode Error -3: graph execution failed")]
+    GraphExecutionFailed,
     /// An unknown error occurred.
     #[error("Encode Error {0}: unknown")]
     Unknown(c_int),
@@ -211,7 +223,9 @@ impl From<NonZeroI32> for DecodeError {
         match value.get() {
             1 => DecodeError::NoKvCacheSlot,
             2 => DecodeError::Aborted,
-            -1 => DecodeError::NTokensZero,
+            -1 => DecodeError::InvalidInputBatch,
+            -2 => DecodeError::AllocationFailed,
+            -3 => DecodeError::GraphExecutionFailed,
             i => DecodeError::Unknown(i),
         }
     }
@@ -221,8 +235,10 @@ impl From<NonZeroI32> for DecodeError {
 impl From<NonZeroI32> for EncodeError {
     fn from(value: NonZeroI32) -> Self {
         match value.get() {
-            1 => EncodeError::NoKvCacheSlot,
-            -1 => EncodeError::NTokensZero,
+            2 => EncodeError::Aborted,
+            -1 => EncodeError::InvalidInputBatch,
+            -2 => EncodeError::AllocationFailed,
+            -3 => EncodeError::GraphExecutionFailed,
             i => EncodeError::Unknown(i),
         }
     }
@@ -355,7 +371,64 @@ pub fn json_schema_to_grammar(schema_json: &str) -> Result<String> {
 
 #[cfg(all(test, feature = "common"))]
 mod tests {
-    use super::json_schema_to_grammar;
+    use std::num::NonZeroI32;
+    use std::ptr;
+
+    use super::{json_schema_to_grammar, DecodeError, EncodeError};
+
+    #[test]
+    fn resident_memory_bridge_reports_invalid_arguments() {
+        let mut report = ptr::null_mut();
+        let mut error = ptr::null_mut();
+        let status = unsafe {
+            llama_cpp_sys_2::llama_rs_memory_breakdown_create(
+                ptr::null(),
+                &raw mut report,
+                &raw mut error,
+            )
+        };
+
+        assert_eq!(status, llama_cpp_sys_2::LLAMA_RS_STATUS_INVALID_ARGUMENT);
+        assert!(report.is_null());
+        assert!(!error.is_null());
+        unsafe { llama_cpp_sys_2::llama_rs_string_free(error) };
+    }
+
+    #[test]
+    fn decode_statuses_are_typed() {
+        assert_eq!(
+            DecodeError::from(NonZeroI32::new(-1).unwrap()),
+            DecodeError::InvalidInputBatch,
+        );
+        assert_eq!(
+            DecodeError::from(NonZeroI32::new(-2).unwrap()),
+            DecodeError::AllocationFailed,
+        );
+        assert_eq!(
+            DecodeError::from(NonZeroI32::new(-3).unwrap()),
+            DecodeError::GraphExecutionFailed,
+        );
+    }
+
+    #[test]
+    fn encode_statuses_are_typed() {
+        assert_eq!(
+            EncodeError::from(NonZeroI32::new(2).unwrap()),
+            EncodeError::Aborted,
+        );
+        assert_eq!(
+            EncodeError::from(NonZeroI32::new(-1).unwrap()),
+            EncodeError::InvalidInputBatch,
+        );
+        assert_eq!(
+            EncodeError::from(NonZeroI32::new(-2).unwrap()),
+            EncodeError::AllocationFailed,
+        );
+        assert_eq!(
+            EncodeError::from(NonZeroI32::new(-3).unwrap()),
+            EncodeError::GraphExecutionFailed,
+        );
+    }
 
     #[test]
     fn json_schema_string_api_returns_grammar() {

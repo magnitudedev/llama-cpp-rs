@@ -8,6 +8,7 @@
 #include <stdint.h>
 
 struct llama_rs_fit_report;
+struct llama_rs_memory_breakdown_report;
 struct llama_rs_fit_calibration;
 
 #ifdef __cplusplus
@@ -274,6 +275,32 @@ bool llama_rs_fit_report_get_kv_layer_workload(
     const struct llama_rs_fit_report * report,
     size_t index,
     struct llama_rs_fit_kv_layer_workload * out_layer);
+
+typedef enum llama_rs_memory_location_kind {
+    LLAMA_RS_MEMORY_LOCATION_HOST = 0,
+    LLAMA_RS_MEMORY_LOCATION_DEVICE = 1,
+} llama_rs_memory_location_kind;
+
+struct llama_rs_memory_breakdown_entry {
+    enum llama_rs_memory_location_kind location;
+    size_t native_index;
+    const char * backend;
+    const char * device_id;
+    uint64_t model_bytes;
+    uint64_t context_bytes;
+    uint64_t compute_bytes;
+};
+
+llama_rs_status llama_rs_memory_breakdown_create(
+    const struct llama_context * ctx,
+    struct llama_rs_memory_breakdown_report ** out_report,
+    char ** out_error);
+void llama_rs_memory_breakdown_free(struct llama_rs_memory_breakdown_report * report);
+size_t llama_rs_memory_breakdown_count(const struct llama_rs_memory_breakdown_report * report);
+bool llama_rs_memory_breakdown_get(
+    const struct llama_rs_memory_breakdown_report * report,
+    size_t index,
+    struct llama_rs_memory_breakdown_entry * out_entry);
 
 void llama_rs_memory_breakdown_print(const struct llama_context * ctx);
 

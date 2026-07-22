@@ -560,6 +560,27 @@ struct llama_rs_fit_report {
     struct llama_rs_fit_decode_workload_storage decode_workload;
 };
 
+struct llama_rs_memory_breakdown_storage {
+    enum llama_rs_memory_location_kind location = LLAMA_RS_MEMORY_LOCATION_HOST;
+    size_t native_index = 0;
+    std::string backend;
+    std::string device_id;
+    uint64_t model_bytes = 0;
+    uint64_t context_bytes = 0;
+    uint64_t compute_bytes = 0;
+};
+
+struct llama_rs_memory_breakdown_report {
+    std::vector<llama_rs_memory_breakdown_storage> entries;
+};
+
+static void llama_rs_memory_breakdown_add(uint64_t & target, size_t value) {
+    if (value > std::numeric_limits<uint64_t>::max() - target) {
+        throw std::overflow_error("resident-memory byte count overflowed uint64_t");
+    }
+    target += static_cast<uint64_t>(value);
+}
+
 struct llama_rs_context_other_guard {
     llama_context_params * params;
     llama_context * original;
@@ -1282,6 +1303,122 @@ extern "C" int llama_rs_fit_params(
     } catch (...) {
         return static_cast<int>(COMMON_PARAMS_FIT_STATUS_ERROR);
     }
+}
+
+extern "C" llama_rs_status llama_rs_memory_breakdown_create(
+    const struct llama_context * ctx,
+    struct llama_rs_memory_breakdown_report ** out_report,
+    char ** out_error) {
+    if (out_error) {
+        *out_error = nullptr;
+    }
+    if (out_report) {
+        *out_report = nullptr;
+    }
+    if (!ctx || !out_report) {
+        return llama_rs_chat_set_error(
+            out_error,
+            LLAMA_RS_STATUS_INVALID_ARGUMENT,
+            "memory breakdown arguments must not be null");
+    }
+    try {
+        auto report = std::make_unique<llama_rs_memory_breakdown_report>();
+        const auto memory = llama_get_memory_breakdown(ctx);
+        for (const auto & [buffer_type, breakdown] : memory) {
+            if (breakdown.model == 0 && breakdown.context == 0 && breakdown.compute == 0) {
+                continue;
+            }
+
+            llama_rs_memory_breakdown_storage * target = nullptr;
+            if (ggml_backend_buft_is_host(buffer_type)) {
+                const auto found = std::find_if(
+                    report->entries.begin(), report->entries.end(),
+                    [](const auto & entry) {
+                        return entry.location == LLAMA_RS_MEMORY_LOCATION_HOST;
+                    });
+                if (found == report->entries.end()) {
+                    report->entries.push_back({});
+                    target = &report->entries.back();
+                    target->location = LLAMA_RS_MEMORY_LOCATION_HOST;
+                } else {
+                    target = &*found;
+                }
+            } else {
+                const auto device = ggml_backend_buft_get_device(buffer_type);
+                if (!device) {
+                    return llama_rs_chat_set_error(
+                        out_error,
+                        LLAMA_RS_STATUS_INVALID_STATE,
+                        "resident allocation buffer has no backend device");
+                }
+                size_t native_index = ggml_backend_dev_count();
+                for (size_t index = 0; index < ggml_backend_dev_count(); ++index) {
+                    if (ggml_backend_dev_get(index) == device) {
+                        native_index = index;
+                        break;
+                    }
+                }
+                if (native_index == ggml_backend_dev_count()) {
+                    return llama_rs_chat_set_error(
+                        out_error,
+                        LLAMA_RS_STATUS_INVALID_STATE,
+                        "resident allocation device is not registered");
+                }
+                const auto found = std::find_if(
+                    report->entries.begin(), report->entries.end(),
+                    [native_index](const auto & entry) {
+                        return entry.location == LLAMA_RS_MEMORY_LOCATION_DEVICE
+                            && entry.native_index == native_index;
+                    });
+                if (found == report->entries.end()) {
+                    report->entries.push_back({});
+                    target = &report->entries.back();
+                    target->location = LLAMA_RS_MEMORY_LOCATION_DEVICE;
+                    target->native_index = native_index;
+                    target->backend = llama_rs_fit_backend_name(device);
+                    target->device_id = llama_rs_fit_device_id(device);
+                } else {
+                    target = &*found;
+                }
+            }
+            llama_rs_memory_breakdown_add(target->model_bytes, breakdown.model);
+            llama_rs_memory_breakdown_add(target->context_bytes, breakdown.context);
+            llama_rs_memory_breakdown_add(target->compute_bytes, breakdown.compute);
+        }
+        *out_report = report.release();
+        return LLAMA_RS_STATUS_OK;
+    } catch (...) {
+        return llama_rs_chat_current_exception(out_error);
+    }
+}
+
+extern "C" void llama_rs_memory_breakdown_free(
+    struct llama_rs_memory_breakdown_report * report) {
+    delete report;
+}
+
+extern "C" size_t llama_rs_memory_breakdown_count(
+    const struct llama_rs_memory_breakdown_report * report) {
+    return report ? report->entries.size() : 0;
+}
+
+extern "C" bool llama_rs_memory_breakdown_get(
+    const struct llama_rs_memory_breakdown_report * report,
+    size_t index,
+    struct llama_rs_memory_breakdown_entry * out_entry) {
+    if (!report || !out_entry || index >= report->entries.size()) {
+        return false;
+    }
+    const auto & source = report->entries[index];
+    *out_entry = {};
+    out_entry->location = source.location;
+    out_entry->native_index = source.native_index;
+    out_entry->backend = source.backend.empty() ? nullptr : source.backend.c_str();
+    out_entry->device_id = source.device_id.empty() ? nullptr : source.device_id.c_str();
+    out_entry->model_bytes = source.model_bytes;
+    out_entry->context_bytes = source.context_bytes;
+    out_entry->compute_bytes = source.compute_bytes;
+    return true;
 }
 
 extern "C" void llama_rs_memory_breakdown_print(const struct llama_context * ctx) {
