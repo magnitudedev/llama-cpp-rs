@@ -202,9 +202,9 @@ pub struct FitKvLayerWorkload {
     pub key_type: i32,
     /// Raw V-cache `ggml_type`.
     pub value_type: i32,
-    /// Native K row bytes for one occupied token.
+    /// Native K row bytes for one occupied token, or zero when the layer has no attention K row.
     pub key_bytes_per_token: u64,
-    /// Native V row bytes for one occupied token.
+    /// Native V row bytes for one occupied token, or zero when the layer has no attention V row.
     pub value_bytes_per_token: u64,
     /// Sliding-window cap, or zero for full attention.
     pub sliding_window_tokens: u32,
@@ -1188,9 +1188,9 @@ fn decode_kv_layer_workload(
         ));
     }
     let raw = unsafe { raw.assume_init() };
-    if raw.key_bytes_per_token == 0 || raw.value_bytes_per_token == 0 {
+    if !valid_kv_row_bytes(raw.key_bytes_per_token, raw.value_bytes_per_token) {
         return Err(FitReportError::Malformed(
-            "decode KV layer workload has zero row bytes",
+            "decode KV layer workload has incomplete row bytes",
         ));
     }
     Ok(FitKvLayerWorkload {
@@ -1208,6 +1208,10 @@ fn decode_kv_layer_workload(
         sliding_window_tokens: raw.sliding_window_tokens,
         recurrent: raw.recurrent,
     })
+}
+
+fn valid_kv_row_bytes(key_bytes: u64, value_bytes: u64) -> bool {
+    (key_bytes == 0) == (value_bytes == 0)
 }
 
 fn decode_configurations(
@@ -1625,6 +1629,14 @@ mod tests {
             borrowed_string(invalid.as_ptr().cast(), "name"),
             Err(FitReportError::InvalidUtf8 { field: "name" })
         ));
+    }
+
+    #[test]
+    fn kv_row_bytes_are_both_present_or_both_absent() {
+        assert!(valid_kv_row_bytes(0, 0));
+        assert!(valid_kv_row_bytes(8, 8));
+        assert!(!valid_kv_row_bytes(0, 8));
+        assert!(!valid_kv_row_bytes(8, 0));
     }
 
     #[test]
