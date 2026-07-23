@@ -100,8 +100,14 @@ typedef struct llama_rs_fit_decode_workload_summary {
     bool available;
     const char * method;
     const char * unavailable_reason;
+    const char * architecture;
     uint32_t expert_count;
     uint32_t expert_used_count;
+    uint32_t nextn_layer_count;
+    uint32_t kv_lora_rank;
+    uint32_t indexer_head_count;
+    uint32_t indexer_head_size;
+    uint32_t indexer_top_k;
     bool hybrid_model;
     bool recurrent_model;
 } llama_rs_fit_decode_workload_summary;
@@ -113,6 +119,7 @@ typedef struct llama_rs_fit_tensor_workload {
     const char * device_id;
     int32_t tensor_type;
     enum llama_rs_fit_tensor_workload_kind kind;
+    bool baseline_executed;
     uint64_t stored_bytes;
     uint64_t operation_bytes;
 } llama_rs_fit_tensor_workload;
@@ -126,8 +133,16 @@ typedef struct llama_rs_fit_kv_layer_workload {
     int32_t value_type;
     uint64_t key_bytes_per_token;
     uint64_t value_bytes_per_token;
+    uint32_t attention_head_size;
+    int32_t attention_state_type;
     uint32_t sliding_window_tokens;
+    uint32_t compression_ratio;
+    bool sparse_index;
+    uint64_t indexer_bytes_per_token;
     bool recurrent;
+    int32_t recurrent_type;
+    uint64_t recurrent_conv_bytes;
+    uint64_t recurrent_state_bytes;
 } llama_rs_fit_kv_layer_workload;
 
 // Runs bounded, model-free ggml backend calibration. No model is loaded and no

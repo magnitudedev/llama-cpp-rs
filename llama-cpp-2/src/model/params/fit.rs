@@ -1,6 +1,6 @@
 //! Typed diagnostics for llama.cpp's `common/fit` estimator.
 
-use std::ffi::{c_char, CStr};
+use std::ffi::{CStr, c_char};
 use std::mem::MaybeUninit;
 use std::pin::Pin;
 use std::ptr::{self, NonNull};
@@ -14,7 +14,7 @@ use llama_cpp_sys_2 as sys;
 pub const FIT_CALIBRATION_METHOD: &str = "llama-native-ggml-decode-calibration-v1";
 
 /// Stable identity of the native decode-workload projection.
-pub const FIT_DECODE_WORKLOAD_METHOD: &str = "llama-native-decode-workload-v1";
+pub const FIT_DECODE_WORKLOAD_METHOD: &str = "llama-native-decode-workload-v2";
 
 /// Resolve the exact math-thread default from the pinned native common runtime.
 #[must_use]
@@ -180,6 +180,8 @@ pub struct FitTensorWorkload {
     pub tensor_type: i32,
     /// Native access class.
     pub kind: FitTensorWorkloadKind,
+    /// Whether ordinary target-model decode executes this tensor.
+    pub baseline_executed: bool,
     /// Complete tensor storage.
     pub stored_bytes: u64,
     /// Bytes touched by one operation before routed-expert selection is applied.
@@ -206,10 +208,26 @@ pub struct FitKvLayerWorkload {
     pub key_bytes_per_token: u64,
     /// Native V row bytes for one occupied token, or zero when the layer has no attention V row.
     pub value_bytes_per_token: u64,
+    /// Native attention key-head width used by architecture-specific cache state.
+    pub attention_head_size: u32,
+    /// Raw `ggml_type` of architecture-specific fixed attention state.
+    pub attention_state_type: i32,
     /// Sliding-window cap, or zero for full attention.
     pub sliding_window_tokens: u32,
+    /// Native cache compression ratio, or zero for ordinary KV/recurrent layers.
+    pub compression_ratio: u32,
+    /// Whether the baseline graph executes a sparse context index for this layer.
+    pub sparse_index: bool,
+    /// Native sparse-index key row bytes for one occupied position.
+    pub indexer_bytes_per_token: u64,
     /// Whether this layer is recurrent.
     pub recurrent: bool,
+    /// Raw `ggml_type` of the fixed recurrent state.
+    pub recurrent_type: i32,
+    /// Fixed convolution-state bytes read or written for one sequence.
+    pub recurrent_conv_bytes: u64,
+    /// Fixed recurrent matrix-state bytes read or written for one sequence.
+    pub recurrent_state_bytes: u64,
 }
 
 /// Native decode facts attached to a fitted no-allocation model.
@@ -218,10 +236,22 @@ pub struct FitKvLayerWorkload {
 pub struct FitDecodeWorkload {
     /// Stable native workload schema identity.
     pub method: String,
+    /// Canonical llama.cpp architecture identity for this artifact.
+    pub architecture: String,
     /// Total routed experts declared by the model.
     pub expert_count: u32,
     /// Routed experts selected for one token.
     pub expert_used_count: u32,
+    /// Auxiliary NextN/MTP layers stored by the artifact.
+    pub nextn_layer_count: u32,
+    /// Native compressed KV/MLA rank, or zero when unused.
+    pub kv_lora_rank: u32,
+    /// Sparse-index query head count, or zero when unused.
+    pub indexer_head_count: u32,
+    /// Sparse-index key width, or zero when unused.
+    pub indexer_head_size: u32,
+    /// Sparse positions gathered per layer, or zero when unused.
+    pub indexer_top_k: u32,
     /// Whether the model mixes native layer architectures.
     pub hybrid_model: bool,
     /// Whether the model contains recurrent execution.
@@ -1126,8 +1156,14 @@ fn decode_workload(
     Ok(FitDecodeWorkloadAssessment::Available {
         workload: FitDecodeWorkload {
             method,
+            architecture: borrowed_string(raw.architecture, "decode_workload.architecture")?,
             expert_count: raw.expert_count,
             expert_used_count: raw.expert_used_count,
+            nextn_layer_count: raw.nextn_layer_count,
+            kv_lora_rank: raw.kv_lora_rank,
+            indexer_head_count: raw.indexer_head_count,
+            indexer_head_size: raw.indexer_head_size,
+            indexer_top_k: raw.indexer_top_k,
             hybrid_model: raw.hybrid_model,
             recurrent_model: raw.recurrent_model,
             tensors,
@@ -1170,6 +1206,7 @@ fn decode_tensor_workload(
         device_id: optional_borrowed_string(raw.device_id, "decode_workload.tensors[].device_id")?,
         tensor_type: raw.tensor_type,
         kind,
+        baseline_executed: raw.baseline_executed,
         stored_bytes: raw.stored_bytes,
         operation_bytes: raw.operation_bytes,
     })
@@ -1205,8 +1242,16 @@ fn decode_kv_layer_workload(
         value_type: raw.value_type,
         key_bytes_per_token: raw.key_bytes_per_token,
         value_bytes_per_token: raw.value_bytes_per_token,
+        attention_head_size: raw.attention_head_size,
+        attention_state_type: raw.attention_state_type,
         sliding_window_tokens: raw.sliding_window_tokens,
+        compression_ratio: raw.compression_ratio,
+        sparse_index: raw.sparse_index,
+        indexer_bytes_per_token: raw.indexer_bytes_per_token,
         recurrent: raw.recurrent,
+        recurrent_type: raw.recurrent_type,
+        recurrent_conv_bytes: raw.recurrent_conv_bytes,
+        recurrent_state_bytes: raw.recurrent_state_bytes,
     })
 }
 

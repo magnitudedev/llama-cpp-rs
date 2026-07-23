@@ -46,7 +46,7 @@ extern "C" int32_t llama_rs_common_default_math_threads(void) {
 static constexpr const char * LLAMA_RS_FIT_CALIBRATION_METHOD =
     "llama-native-ggml-decode-calibration-v1";
 static constexpr const char * LLAMA_RS_FIT_DECODE_WORKLOAD_METHOD =
-    "llama-native-decode-workload-v1";
+    "llama-native-decode-workload-v2";
 
 struct llama_rs_fit_calibration_metric_storage {
     int32_t backend_type = 0;
@@ -71,6 +71,7 @@ struct llama_rs_fit_tensor_workload_storage {
     std::string device_id;
     int32_t tensor_type = 0;
     enum llama_rs_fit_tensor_workload_kind kind = LLAMA_RS_FIT_TENSOR_ALWAYS_ACTIVE;
+    bool baseline_executed = true;
     uint64_t stored_bytes = 0;
     uint64_t operation_bytes = 0;
 };
@@ -84,16 +85,30 @@ struct llama_rs_fit_kv_layer_workload_storage {
     int32_t value_type = 0;
     uint64_t key_bytes_per_token = 0;
     uint64_t value_bytes_per_token = 0;
+    uint32_t attention_head_size = 0;
+    int32_t attention_state_type = GGML_TYPE_F32;
     uint32_t sliding_window_tokens = 0;
+    uint32_t compression_ratio = 0;
+    bool sparse_index = false;
+    uint64_t indexer_bytes_per_token = 0;
     bool recurrent = false;
+    int32_t recurrent_type = GGML_TYPE_F32;
+    uint64_t recurrent_conv_bytes = 0;
+    uint64_t recurrent_state_bytes = 0;
 };
 
 struct llama_rs_fit_decode_workload_storage {
     bool available = false;
     std::string method = LLAMA_RS_FIT_DECODE_WORKLOAD_METHOD;
     std::string unavailable_reason = "decode workload was not requested";
+    std::string architecture;
     uint32_t expert_count = 0;
     uint32_t expert_used_count = 0;
+    uint32_t nextn_layer_count = 0;
+    uint32_t kv_lora_rank = 0;
+    uint32_t indexer_head_count = 0;
+    uint32_t indexer_head_size = 0;
+    uint32_t indexer_top_k = 0;
     bool hybrid_model = false;
     bool recurrent_model = false;
     std::vector<llama_rs_fit_tensor_workload_storage> tensors;
@@ -131,6 +146,39 @@ static bool llama_rs_fit_is_routed_expert_tensor(const ggml_tensor * tensor) {
     return name && std::strstr(name, "_exps") != nullptr;
 }
 
+static bool llama_rs_fit_is_baseline_tensor(
+    const char * name,
+    uint32_t main_layer_count) {
+    if (!name) {
+        return true;
+    }
+    if (std::strstr(name, ".nextn.") != nullptr ||
+        std::strncmp(name, "nextn.", 6) == 0 ||
+        std::strstr(name, ".mtp.") != nullptr ||
+        std::strncmp(name, "mtp.", 4) == 0) {
+        return false;
+    }
+    if (std::strncmp(name, "blk.", 4) == 0) {
+        char * end = nullptr;
+        const unsigned long layer = std::strtoul(name + 4, &end, 10);
+        if (end != name + 4 && end && *end == '.' && layer >= main_layer_count) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool llama_rs_fit_is_row_lookup_tensor(
+    const llama_model * model,
+    const ggml_tensor * tensor,
+    const char * name) {
+    return (tensor == model->tok_embd && model->output && tensor != model->output) ||
+           tensor == model->per_layer_tok_embd ||
+           tensor == model->pos_embd ||
+           tensor == model->type_embd ||
+           (name && std::strstr(name, "ffn_gate_tid2eid") != nullptr);
+}
+
 static ggml_backend_dev_t llama_rs_fit_tensor_device(const ggml_tensor * tensor) {
     if (!tensor || !tensor->buffer) {
         return nullptr;
@@ -146,8 +194,14 @@ static struct llama_rs_fit_decode_workload_storage llama_rs_fit_extract_decode_w
     const llama_model * model,
     const llama_context_params * cparams) {
     llama_rs_fit_decode_workload_storage result;
+    result.architecture = model->arch_name();
     result.expert_count = model->hparams.n_expert;
     result.expert_used_count = model->hparams.n_expert_used;
+    result.nextn_layer_count = model->hparams.n_layer_nextn;
+    result.kv_lora_rank = model->hparams.n_lora_kv;
+    result.indexer_head_count = model->hparams.indexer_n_head;
+    result.indexer_head_size = model->hparams.indexer_head_size;
+    result.indexer_top_k = model->hparams.indexer_top_k;
     result.hybrid_model = llama_model_is_hybrid(model);
     result.recurrent_model = llama_model_is_recurrent(model);
 
@@ -169,13 +223,14 @@ static struct llama_rs_fit_decode_workload_storage llama_rs_fit_extract_decode_w
         output.backend = llama_rs_fit_backend_name(device);
         output.device_id = llama_rs_fit_device_id(device);
         output.tensor_type = static_cast<int32_t>(tensor->type);
+        output.baseline_executed = llama_rs_fit_is_baseline_tensor(
+            entry.first.c_str(), model->hparams.n_layer());
         output.stored_bytes = ggml_nbytes(tensor);
         output.operation_bytes = output.stored_bytes;
         if (llama_rs_fit_is_routed_expert_tensor(tensor)) {
             output.kind = LLAMA_RS_FIT_TENSOR_ROUTED_EXPERT;
-        } else if ((tensor == model->tok_embd && tensor != model->output) ||
-                   tensor == model->per_layer_tok_embd || tensor == model->pos_embd ||
-                   tensor == model->type_embd) {
+        } else if (llama_rs_fit_is_row_lookup_tensor(
+                       model, tensor, entry.first.c_str())) {
             output.kind = LLAMA_RS_FIT_TENSOR_ROW_LOOKUP;
             output.operation_bytes = ggml_row_size(tensor->type, tensor->ne[0]);
         }
@@ -206,12 +261,35 @@ static struct llama_rs_fit_decode_workload_storage llama_rs_fit_extract_decode_w
         output.value_type = static_cast<int32_t>(cparams->type_v);
         output.key_bytes_per_token = ggml_row_size(
             cparams->type_k, hparams.n_embd_k_gqa(layer));
-        output.value_bytes_per_token = ggml_row_size(
-            cparams->type_v, hparams.n_embd_v_gqa(layer));
+        output.value_bytes_per_token = hparams.is_mla()
+            ? 0
+            : ggml_row_size(cparams->type_v, hparams.n_embd_v_gqa(layer));
+        output.attention_head_size = model->arch == LLM_ARCH_DEEPSEEK4
+            ? hparams.n_embd_head_k()
+            : hparams.n_embd_head_k(layer);
+        output.attention_state_type = GGML_TYPE_F32;
         output.sliding_window_tokens = hparams.n_swa > 0 && hparams.is_swa(layer)
             ? hparams.n_swa
             : 0;
+        output.compression_ratio = model->arch == LLM_ARCH_DEEPSEEK4
+            ? hparams.dsv4_compress_ratios[layer]
+            : 0;
+        output.sparse_index =
+            model->layers[layer].indexer_attn_k != nullptr &&
+            hparams.indexer_head_size > 0 &&
+            hparams.indexer_top_k > 0;
+        if (output.sparse_index) {
+            output.indexer_bytes_per_token =
+                ggml_row_size(cparams->type_k, hparams.indexer_head_size);
+        }
         output.recurrent = hparams.is_recr(layer);
+        if (output.recurrent) {
+            output.recurrent_type = GGML_TYPE_F32;
+            output.recurrent_conv_bytes =
+                ggml_row_size(GGML_TYPE_F32, hparams.n_embd_r());
+            output.recurrent_state_bytes =
+                ggml_row_size(GGML_TYPE_F32, hparams.n_embd_s());
+        }
         result.kv_layers.push_back(std::move(output));
     }
 
@@ -1216,8 +1294,14 @@ extern "C" bool llama_rs_fit_report_get_decode_workload_summary(
     out_summary->unavailable_reason = source.unavailable_reason.empty()
         ? nullptr
         : source.unavailable_reason.c_str();
+    out_summary->architecture = source.architecture.c_str();
     out_summary->expert_count = source.expert_count;
     out_summary->expert_used_count = source.expert_used_count;
+    out_summary->nextn_layer_count = source.nextn_layer_count;
+    out_summary->kv_lora_rank = source.kv_lora_rank;
+    out_summary->indexer_head_count = source.indexer_head_count;
+    out_summary->indexer_head_size = source.indexer_head_size;
+    out_summary->indexer_top_k = source.indexer_top_k;
     out_summary->hybrid_model = source.hybrid_model;
     out_summary->recurrent_model = source.recurrent_model;
     return true;
@@ -1243,6 +1327,7 @@ extern "C" bool llama_rs_fit_report_get_tensor_workload(
     out_tensor->device_id = source.device_id.empty() ? nullptr : source.device_id.c_str();
     out_tensor->tensor_type = source.tensor_type;
     out_tensor->kind = source.kind;
+    out_tensor->baseline_executed = source.baseline_executed;
     out_tensor->stored_bytes = source.stored_bytes;
     out_tensor->operation_bytes = source.operation_bytes;
     return true;
@@ -1270,8 +1355,16 @@ extern "C" bool llama_rs_fit_report_get_kv_layer_workload(
     out_layer->value_type = source.value_type;
     out_layer->key_bytes_per_token = source.key_bytes_per_token;
     out_layer->value_bytes_per_token = source.value_bytes_per_token;
+    out_layer->attention_head_size = source.attention_head_size;
+    out_layer->attention_state_type = source.attention_state_type;
     out_layer->sliding_window_tokens = source.sliding_window_tokens;
+    out_layer->compression_ratio = source.compression_ratio;
+    out_layer->sparse_index = source.sparse_index;
+    out_layer->indexer_bytes_per_token = source.indexer_bytes_per_token;
     out_layer->recurrent = source.recurrent;
+    out_layer->recurrent_type = source.recurrent_type;
+    out_layer->recurrent_conv_bytes = source.recurrent_conv_bytes;
+    out_layer->recurrent_state_bytes = source.recurrent_state_bytes;
     return true;
 }
 
