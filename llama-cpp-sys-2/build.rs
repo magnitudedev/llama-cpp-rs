@@ -344,6 +344,7 @@ fn main() {
         .allowlist_type("gguf_.*")
         .allowlist_function("llama_.*")
         .allowlist_type("llama_.*")
+        .rustified_enum("llama_ftype")
         .prepend_enum_name(false);
 
     // The common `llama_rs_*` symbols are emitted by the subsystem bridge

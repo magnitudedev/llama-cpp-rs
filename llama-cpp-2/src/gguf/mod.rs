@@ -7,6 +7,128 @@ use std::ffi::{CStr, CString};
 use std::path::Path;
 use std::ptr::NonNull;
 
+macro_rules! file_types {
+    ($($variant:ident => $native:ident),+ $(,)?) => {
+        /// A GGUF model file type supported by the pinned llama.cpp runtime.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+        #[repr(u32)]
+        pub enum FileType {
+            $(
+                #[doc = concat!("The llama.cpp `", stringify!($native), "` file type.")]
+                $variant = llama_cpp_sys_2::llama_ftype::$native as u32,
+            )+
+        }
+
+        impl TryFrom<u32> for FileType {
+            type Error = UnknownFileType;
+
+            fn try_from(value: u32) -> Result<Self, Self::Error> {
+                match value {
+                    $(
+                        value if value == Self::$variant as u32 => Ok(Self::$variant),
+                    )+
+                    value => Err(UnknownFileType(value)),
+                }
+            }
+        }
+
+        impl From<FileType> for llama_cpp_sys_2::llama_ftype {
+            fn from(value: FileType) -> Self {
+                match value {
+                    $(
+                        FileType::$variant => Self::$native,
+                    )+
+                }
+            }
+        }
+
+        impl From<llama_cpp_sys_2::llama_ftype> for FileType {
+            fn from(value: llama_cpp_sys_2::llama_ftype) -> Self {
+                match value {
+                    $(
+                        llama_cpp_sys_2::llama_ftype::$native => Self::$variant,
+                    )+
+                }
+            }
+        }
+    };
+}
+
+file_types! {
+    AllF32 => LLAMA_FTYPE_ALL_F32,
+    MostlyF16 => LLAMA_FTYPE_MOSTLY_F16,
+    MostlyQ4_0 => LLAMA_FTYPE_MOSTLY_Q4_0,
+    MostlyQ4_1 => LLAMA_FTYPE_MOSTLY_Q4_1,
+    MostlyQ8_0 => LLAMA_FTYPE_MOSTLY_Q8_0,
+    MostlyQ5_0 => LLAMA_FTYPE_MOSTLY_Q5_0,
+    MostlyQ5_1 => LLAMA_FTYPE_MOSTLY_Q5_1,
+    MostlyQ2K => LLAMA_FTYPE_MOSTLY_Q2_K,
+    MostlyQ3KSmall => LLAMA_FTYPE_MOSTLY_Q3_K_S,
+    MostlyQ3KMedium => LLAMA_FTYPE_MOSTLY_Q3_K_M,
+    MostlyQ3KLarge => LLAMA_FTYPE_MOSTLY_Q3_K_L,
+    MostlyQ4KSmall => LLAMA_FTYPE_MOSTLY_Q4_K_S,
+    MostlyQ4KMedium => LLAMA_FTYPE_MOSTLY_Q4_K_M,
+    MostlyQ5KSmall => LLAMA_FTYPE_MOSTLY_Q5_K_S,
+    MostlyQ5KMedium => LLAMA_FTYPE_MOSTLY_Q5_K_M,
+    MostlyQ6K => LLAMA_FTYPE_MOSTLY_Q6_K,
+    MostlyIq2Xxs => LLAMA_FTYPE_MOSTLY_IQ2_XXS,
+    MostlyIq2Xs => LLAMA_FTYPE_MOSTLY_IQ2_XS,
+    MostlyQ2KSmall => LLAMA_FTYPE_MOSTLY_Q2_K_S,
+    MostlyIq3Xs => LLAMA_FTYPE_MOSTLY_IQ3_XS,
+    MostlyIq3Xxs => LLAMA_FTYPE_MOSTLY_IQ3_XXS,
+    MostlyIq1Small => LLAMA_FTYPE_MOSTLY_IQ1_S,
+    MostlyIq4Nl => LLAMA_FTYPE_MOSTLY_IQ4_NL,
+    MostlyIq3Small => LLAMA_FTYPE_MOSTLY_IQ3_S,
+    MostlyIq3Medium => LLAMA_FTYPE_MOSTLY_IQ3_M,
+    MostlyIq2Small => LLAMA_FTYPE_MOSTLY_IQ2_S,
+    MostlyIq2Medium => LLAMA_FTYPE_MOSTLY_IQ2_M,
+    MostlyIq4Xs => LLAMA_FTYPE_MOSTLY_IQ4_XS,
+    MostlyIq1Medium => LLAMA_FTYPE_MOSTLY_IQ1_M,
+    MostlyBf16 => LLAMA_FTYPE_MOSTLY_BF16,
+    MostlyTq1_0 => LLAMA_FTYPE_MOSTLY_TQ1_0,
+    MostlyTq2_0 => LLAMA_FTYPE_MOSTLY_TQ2_0,
+    MostlyMxfp4Moe => LLAMA_FTYPE_MOSTLY_MXFP4_MOE,
+    MostlyNvfp4 => LLAMA_FTYPE_MOSTLY_NVFP4,
+    MostlyQ1_0 => LLAMA_FTYPE_MOSTLY_Q1_0,
+    MostlyQ2_0 => LLAMA_FTYPE_MOSTLY_Q2_0,
+    Guessed => LLAMA_FTYPE_GUESSED,
+}
+
+impl FileType {
+    /// The numeric value stored in GGUF `general.file_type` metadata.
+    #[must_use]
+    pub const fn as_raw(self) -> u32 {
+        self as u32
+    }
+
+    /// llama.cpp's authoritative name for this file type.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if llama.cpp returns a null pointer or invalid UTF-8.
+    pub fn name(self) -> Result<&'static str, FileTypeNameError> {
+        let pointer = unsafe { llama_cpp_sys_2::llama_ftype_name(self.into()) };
+        let pointer = NonNull::new(pointer.cast_mut()).ok_or(FileTypeNameError::Null)?;
+        Ok(unsafe { CStr::from_ptr(pointer.as_ptr()) }.to_str()?)
+    }
+}
+
+/// A numeric GGUF model file type not recognized by the pinned llama.cpp runtime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("unknown GGUF model file type {0}")]
+pub struct UnknownFileType(pub u32);
+
+/// Failure to read a model file type name from llama.cpp.
+#[derive(Debug, thiserror::Error)]
+pub enum FileTypeNameError {
+    /// llama.cpp unexpectedly returned a null pointer.
+    #[error("llama.cpp returned a null model file type name")]
+    Null,
+    /// llama.cpp returned a model file type name that was not valid UTF-8.
+    #[error("llama.cpp returned a model file type name that was not valid UTF-8")]
+    InvalidUtf8(#[from] std::str::Utf8Error),
+}
+
 /// A safe wrapper around `gguf_context`.
 ///
 /// Opens a GGUF file and parses only the metadata header; tensor weights are
