@@ -94,6 +94,9 @@ typedef struct llama_rs_fit_calibration_metric {
     double bytes_per_second;
     double launch_microseconds;
     double relative_spread;
+    uint32_t sample_count;
+    uint64_t measured_microseconds;
+    bool stable;
 } llama_rs_fit_calibration_metric;
 
 typedef struct llama_rs_fit_decode_workload_summary {

@@ -44,7 +44,7 @@ extern "C" int32_t llama_rs_common_default_math_threads(void) {
 }
 
 static constexpr const char * LLAMA_RS_FIT_CALIBRATION_METHOD =
-    "llama-native-ggml-decode-calibration-v1";
+    "llama-native-ggml-decode-calibration-v2";
 static constexpr const char * LLAMA_RS_FIT_DECODE_WORKLOAD_METHOD =
     "llama-native-decode-workload-v2";
 
@@ -57,6 +57,9 @@ struct llama_rs_fit_calibration_metric_storage {
     double bytes_per_second = 0.0;
     double launch_microseconds = 0.0;
     double relative_spread = 0.0;
+    uint32_t sample_count = 0;
+    uint64_t measured_microseconds = 0;
+    bool stable = false;
 };
 
 struct llama_rs_fit_calibration {
@@ -139,6 +142,39 @@ struct llama_rs_fit_measurement {
 
 static bool llama_rs_fit_valid_rate(double value) {
     return std::isfinite(value) && value > 0.0;
+}
+
+static double llama_rs_fit_median(const std::vector<double> & sorted) {
+    const size_t middle = sorted.size() / 2;
+    if (sorted.size() % 2 != 0) {
+        return sorted[middle];
+    }
+    return (sorted[middle - 1] + sorted[middle]) / 2.0;
+}
+
+static double llama_rs_fit_relative_dispersion(const std::vector<double> & rates) {
+    if (rates.size() < 2) {
+        return 0.0;
+    }
+    std::vector<double> sorted = rates;
+    std::sort(sorted.begin(), sorted.end());
+    const double median = llama_rs_fit_median(sorted);
+    if (!llama_rs_fit_valid_rate(median)) {
+        return std::numeric_limits<double>::infinity();
+    }
+
+    std::vector<double> deviations;
+    deviations.reserve(sorted.size());
+    for (const double rate : sorted) {
+        deviations.push_back(std::abs(rate - median));
+    }
+    std::sort(deviations.begin(), deviations.end());
+    const double normalized_mad = 1.4826 * llama_rs_fit_median(deviations) / median;
+    const size_t lower_index = (sorted.size() - 1) / 4;
+    const size_t upper_index = ((sorted.size() - 1) * 3) / 4;
+    const double normalized_iqr =
+        (sorted[upper_index] - sorted[lower_index]) / (1.349 * median);
+    return std::max(normalized_mad, normalized_iqr);
 }
 
 static bool llama_rs_fit_is_routed_expert_tensor(const ggml_tensor * tensor) {
@@ -310,8 +346,16 @@ static bool llama_rs_fit_calibrate_metric(
     // Larger than the shared caches on the consumer systems this estimator targets, avoiding a
     // cache-resident rate that would not represent streaming real model weights.
     constexpr size_t target_weight_bytes = 128ULL * 1024 * 1024;
-    constexpr int graph_repetitions = 1;
-    constexpr int samples = 5;
+    constexpr int64_t warmup_target_microseconds = 10'000;
+    constexpr int warmup_max_iterations = 16;
+    constexpr int64_t block_target_microseconds = 5'000;
+    constexpr int block_max_iterations = 128;
+    constexpr size_t minimum_samples = 5;
+    constexpr size_t maximum_samples = 11;
+    constexpr int64_t minimum_measurement_microseconds = 25'000;
+    constexpr int64_t maximum_measurement_microseconds = 75'000;
+    constexpr double stable_relative_dispersion = 0.05;
+    constexpr int required_stable_checks = 2;
 
     const int64_t block = ggml_blck_size(tensor_type);
     if (block <= 0 || k % block != 0) {
@@ -373,38 +417,77 @@ static bool llama_rs_fit_calibrate_metric(
 
     ggml_cgraph * graph = ggml_new_graph_custom(context.get(), 64, false);
     ggml_build_forward_expand(graph, output);
-    for (int index = 1; index < graph_repetitions; ++index) {
-        ggml_graph_add_node(graph, output);
-    }
-    if (ggml_backend_graph_compute(backend, graph) != GGML_STATUS_SUCCESS) {
-        return false;
-    }
-    ggml_backend_synchronize(backend);
-
-    std::vector<double> rates;
-    rates.reserve(samples);
-    const uint64_t active_weight_bytes = routed
-        ? ggml_nbytes(weights) * expert_used_count / expert_count
-        : ggml_nbytes(weights);
-    for (int sample = 0; sample < samples; ++sample) {
-        const int64_t started_at = llama_time_us();
+    const int64_t warmup_started_at = llama_time_us();
+    int warmup_iterations = 0;
+    do {
         if (ggml_backend_graph_compute(backend, graph) != GGML_STATUS_SUCCESS) {
             return false;
         }
         ggml_backend_synchronize(backend);
+        ++warmup_iterations;
+    } while (
+        warmup_iterations < warmup_max_iterations &&
+        llama_time_us() - warmup_started_at < warmup_target_microseconds);
+
+    const int64_t pilot_started_at = llama_time_us();
+    if (ggml_backend_graph_compute(backend, graph) != GGML_STATUS_SUCCESS) {
+        return false;
+    }
+    ggml_backend_synchronize(backend);
+    const int64_t pilot_elapsed = llama_time_us() - pilot_started_at;
+    if (pilot_elapsed <= 0) {
+        return false;
+    }
+    const int block_iterations = std::clamp<int64_t>(
+        (block_target_microseconds + pilot_elapsed - 1) / pilot_elapsed,
+        1,
+        block_max_iterations);
+
+    std::vector<double> rates;
+    rates.reserve(maximum_samples);
+    const uint64_t active_weight_bytes = routed
+        ? ggml_nbytes(weights) * expert_used_count / expert_count
+        : ggml_nbytes(weights);
+    int64_t measured_microseconds = 0;
+    int stable_checks = 0;
+    bool converged = false;
+    while (rates.size() < maximum_samples) {
+        const int64_t started_at = llama_time_us();
+        for (int iteration = 0; iteration < block_iterations; ++iteration) {
+            if (ggml_backend_graph_compute(backend, graph) != GGML_STATUS_SUCCESS) {
+                return false;
+            }
+            ggml_backend_synchronize(backend);
+        }
         const int64_t elapsed = llama_time_us() - started_at;
         if (elapsed <= 0) {
             return false;
         }
+        measured_microseconds += elapsed;
         rates.push_back(
-            static_cast<double>(active_weight_bytes) * graph_repetitions * 1'000'000.0 /
+            static_cast<double>(active_weight_bytes) * block_iterations * 1'000'000.0 /
             elapsed);
+
+        if (rates.size() < minimum_samples ||
+            measured_microseconds < minimum_measurement_microseconds) {
+            continue;
+        }
+        const double dispersion = llama_rs_fit_relative_dispersion(rates);
+        stable_checks = dispersion <= stable_relative_dispersion ? stable_checks + 1 : 0;
+        if (stable_checks >= required_stable_checks) {
+            converged = true;
+            break;
+        }
+        if (measured_microseconds >= maximum_measurement_microseconds) {
+            break;
+        }
     }
     std::sort(rates.begin(), rates.end());
-    const double median = rates[rates.size() / 2];
+    const double median = llama_rs_fit_median(rates);
     if (!llama_rs_fit_valid_rate(median)) {
         return false;
     }
+    const double dispersion = llama_rs_fit_relative_dispersion(rates);
 
     out->backend_type = static_cast<int32_t>(ggml_backend_dev_type(device));
     out->backend = llama_rs_fit_backend_name(device);
@@ -413,7 +496,10 @@ static bool llama_rs_fit_calibrate_metric(
     out->routed = routed;
     out->bytes_per_second = median;
     out->launch_microseconds = 0.0;
-    out->relative_spread = (rates.back() - rates.front()) / median;
+    out->relative_spread = dispersion;
+    out->sample_count = static_cast<uint32_t>(rates.size());
+    out->measured_microseconds = static_cast<uint64_t>(measured_microseconds);
+    out->stable = converged;
     return true;
 }
 
@@ -517,6 +603,9 @@ extern "C" bool llama_rs_fit_calibration_get_metric(
     out_metric->bytes_per_second = source.bytes_per_second;
     out_metric->launch_microseconds = source.launch_microseconds;
     out_metric->relative_spread = source.relative_spread;
+    out_metric->sample_count = source.sample_count;
+    out_metric->measured_microseconds = source.measured_microseconds;
+    out_metric->stable = source.stable;
     return true;
 }
 

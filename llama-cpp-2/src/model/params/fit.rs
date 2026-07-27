@@ -11,7 +11,7 @@ use crate::model::params::LlamaModelParams;
 use llama_cpp_sys_2 as sys;
 
 /// Stable identity of the native model-free ggml calibration procedure.
-pub const FIT_CALIBRATION_METHOD: &str = "llama-native-ggml-decode-calibration-v1";
+pub const FIT_CALIBRATION_METHOD: &str = "llama-native-ggml-decode-calibration-v2";
 
 /// Stable identity of the native decode-workload projection.
 pub const FIT_DECODE_WORKLOAD_METHOD: &str = "llama-native-decode-workload-v2";
@@ -112,6 +112,12 @@ pub struct FitCalibrationMetric {
     pub launch_microseconds: f64,
     /// Relative spread across the bounded calibration samples.
     pub relative_spread: f64,
+    /// Number of independent timed blocks retained by adaptive calibration.
+    pub sample_count: u32,
+    /// Total native operation time represented by the retained samples.
+    pub measured_microseconds: u64,
+    /// Whether the retained samples converged within the calibration budget.
+    pub stable: bool,
 }
 
 /// Serializable, model-free calibration of the enabled native backends.
@@ -691,6 +697,9 @@ impl FitCalibration {
                 bytes_per_second: raw.bytes_per_second,
                 launch_microseconds: raw.launch_microseconds,
                 relative_spread: raw.relative_spread,
+                sample_count: raw.sample_count,
+                measured_microseconds: raw.measured_microseconds,
+                stable: raw.stable,
             });
         }
         let elapsed =
@@ -724,6 +733,16 @@ impl FitCalibration {
                 "calibration.launch_microseconds",
             )?;
             validate_nonnegative_finite(metric.relative_spread, "calibration.relative_spread")?;
+            if metric.sample_count == 0 {
+                return Err(FitReportError::Malformed(
+                    "calibration metric has no retained samples",
+                ));
+            }
+            if metric.measured_microseconds == 0 {
+                return Err(FitReportError::Malformed(
+                    "calibration metric has no measured duration",
+                ));
+            }
             if metric.backend.is_empty() || metric.backend.as_bytes().contains(&0) {
                 return Err(FitReportError::InvalidCalibrationString {
                     field: "calibration.backend",
@@ -1697,6 +1716,9 @@ mod tests {
                 bytes_per_second: f64::NAN,
                 launch_microseconds: 0.0,
                 relative_spread: 0.0,
+                sample_count: 1,
+                measured_microseconds: 1,
+                stable: true,
             }],
             elapsed_microseconds: 1,
         };
@@ -1722,6 +1744,22 @@ mod tests {
                 field: "calibration.backend"
             })
         ));
+
+        let missing_evidence = FitCalibration {
+            method: FIT_CALIBRATION_METHOD.to_owned(),
+            metrics: vec![FitCalibrationMetric {
+                bytes_per_second: 1.0,
+                sample_count: 0,
+                ..invalid_rate.metrics[0].clone()
+            }],
+            elapsed_microseconds: 1,
+        };
+        assert!(matches!(
+            missing_evidence.validate(),
+            Err(FitReportError::Malformed(
+                "calibration metric has no retained samples"
+            ))
+        ));
     }
 
     #[test]
@@ -1742,6 +1780,11 @@ mod tests {
             assert!(metric.bytes_per_second.is_finite() && metric.bytes_per_second > 0.0);
             assert!(metric.launch_microseconds.is_finite() && metric.launch_microseconds >= 0.0);
             assert!(metric.relative_spread.is_finite() && metric.relative_spread >= 0.0);
+            assert!((5..=11).contains(&metric.sample_count));
+            assert!(metric.measured_microseconds > 0);
+            if metric.stable {
+                assert!(metric.relative_spread <= 0.05);
+            }
         }
     }
 }
