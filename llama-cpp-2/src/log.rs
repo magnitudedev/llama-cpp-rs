@@ -94,14 +94,50 @@ impl Module {
     }
 }
 
-fn meta_for_level(
-    level: llama_cpp_sys_2::ggml_log_level,
-) -> (&'static Metadata<'static>, &'static OverridableFields) {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+enum LogLevel {
+    None,
+    Debug,
+    Info,
+    Warn,
+    Error,
+    Cont,
+    Unknown,
+}
+
+impl LogLevel {
+    fn from_raw(level: llama_cpp_sys_2::ggml_log_level) -> Self {
+        match level {
+            llama_cpp_sys_2::GGML_LOG_LEVEL_NONE => Self::None,
+            llama_cpp_sys_2::GGML_LOG_LEVEL_DEBUG => Self::Debug,
+            llama_cpp_sys_2::GGML_LOG_LEVEL_INFO => Self::Info,
+            llama_cpp_sys_2::GGML_LOG_LEVEL_WARN => Self::Warn,
+            llama_cpp_sys_2::GGML_LOG_LEVEL_ERROR => Self::Error,
+            llama_cpp_sys_2::GGML_LOG_LEVEL_CONT => Self::Cont,
+            _ => Self::Unknown,
+        }
+    }
+
+    fn from_stored(level: u8) -> Self {
+        match level {
+            value if value == Self::None as u8 => Self::None,
+            value if value == Self::Debug as u8 => Self::Debug,
+            value if value == Self::Info as u8 => Self::Info,
+            value if value == Self::Warn as u8 => Self::Warn,
+            value if value == Self::Error as u8 => Self::Error,
+            value if value == Self::Cont as u8 => Self::Cont,
+            _ => Self::Unknown,
+        }
+    }
+}
+
+fn meta_for_level(level: LogLevel) -> (&'static Metadata<'static>, &'static OverridableFields) {
     match level {
-        llama_cpp_sys_2::GGML_LOG_LEVEL_DEBUG => (&DEBUG_META, &DEBUG_FIELDS),
-        llama_cpp_sys_2::GGML_LOG_LEVEL_INFO => (&INFO_META, &INFO_FIELDS),
-        llama_cpp_sys_2::GGML_LOG_LEVEL_WARN => (&WARN_META, &WARN_FIELDS),
-        llama_cpp_sys_2::GGML_LOG_LEVEL_ERROR => (&ERROR_META, &ERROR_FIELDS),
+        LogLevel::Debug => (&DEBUG_META, &DEBUG_FIELDS),
+        LogLevel::Info => (&INFO_META, &INFO_FIELDS),
+        LogLevel::Warn => (&WARN_META, &WARN_FIELDS),
+        LogLevel::Error => (&ERROR_META, &ERROR_FIELDS),
         _ => {
             unreachable!("Illegal log level to be called here")
         }
@@ -111,8 +147,8 @@ fn meta_for_level(
 pub(super) struct State {
     pub(super) options: LogOptions,
     module: Module,
-    buffered: std::sync::Mutex<Option<(llama_cpp_sys_2::ggml_log_level, String)>>,
-    previous_level: std::sync::atomic::AtomicU32,
+    buffered: std::sync::Mutex<Option<(LogLevel, String)>>,
+    previous_level: std::sync::atomic::AtomicU8,
     is_buffering: std::sync::atomic::AtomicBool,
 }
 
@@ -122,12 +158,12 @@ impl State {
             options,
             module,
             buffered: std::sync::Mutex::default(),
-            previous_level: std::sync::atomic::AtomicU32::default(),
+            previous_level: std::sync::atomic::AtomicU8::default(),
             is_buffering: std::sync::atomic::AtomicBool::default(),
         }
     }
 
-    fn generate_log(target: Module, level: llama_cpp_sys_2::ggml_log_level, text: &str) {
+    fn generate_log(target: Module, level: LogLevel, text: &str) {
         // Annoying but tracing requires that the provided target name is a string literal and
         // even &'static str isn't enough so we have to duplicate the generation AND we can't even
         // extract the interrior module within llama.cpp/ggml to be able to propagate it forward.
@@ -180,11 +216,12 @@ impl State {
                 *lock = Some((previous_log_level, buffer));
             }
         } else {
-            let level = self
-                .previous_level
-                .load(std::sync::atomic::Ordering::Acquire);
+            let level = LogLevel::from_stored(
+                self.previous_level
+                    .load(std::sync::atomic::Ordering::Acquire),
+            );
             tracing::warn!(
-                inferred_level = level,
+                inferred_level = ?level,
                 text = text,
                 origin = "crate",
                 "llma.cpp sent out a CONT log without any previously buffered message"
@@ -195,8 +232,9 @@ impl State {
 
     /// Start buffering a message. Not the CONT log level and text is missing a newline.
     pub(super) fn buffer_non_cont(&self, level: llama_cpp_sys_2::ggml_log_level, text: &str) {
+        let level = LogLevel::from_raw(level);
         debug_assert!(!text.ends_with('\n'));
-        debug_assert_ne!(level, llama_cpp_sys_2::GGML_LOG_LEVEL_CONT);
+        debug_assert_ne!(level, LogLevel::Cont);
 
         if let Some((previous_log_level, buffer)) = self
             .buffered
@@ -205,7 +243,7 @@ impl State {
             .replace((level, text.to_string()))
         {
             tracing::warn!(
-                level = previous_log_level,
+                level = ?previous_log_level,
                 text = &buffer,
                 origin = "crate",
                 "Message buffered unnnecessarily due to missing newline and not followed by a CONT"
@@ -216,13 +254,15 @@ impl State {
         self.is_buffering
             .store(true, std::sync::atomic::Ordering::Release);
         self.previous_level
-            .store(level, std::sync::atomic::Ordering::Release);
+            .store(level as u8, std::sync::atomic::Ordering::Release);
     }
 
     // Emit a normal unbuffered log message (not the CONT log level and the text ends with a newline).
     pub(super) fn emit_non_cont_line(&self, level: llama_cpp_sys_2::ggml_log_level, text: &str) {
+        let raw_level = i64::from(level);
+        let level = LogLevel::from_raw(level);
         debug_assert!(text.ends_with('\n'));
-        debug_assert_ne!(level, llama_cpp_sys_2::GGML_LOG_LEVEL_CONT);
+        debug_assert_ne!(level, LogLevel::Cont);
 
         if self
             .is_buffering
@@ -230,30 +270,29 @@ impl State {
         {
             if let Some((buf_level, buf_text)) = self.buffered.lock().unwrap().take() {
                 // This warning indicates a bug within llama.cpp
-                tracing::warn!(level = buf_level, text = buf_text, origin = "crate", "llama.cpp message buffered spuriously due to missing \\n and being followed by a non-CONT message!");
+                tracing::warn!(level = ?buf_level, text = buf_text, origin = "crate", "llama.cpp message buffered spuriously due to missing \\n and being followed by a non-CONT message!");
                 Self::generate_log(self.module, buf_level, buf_text.as_str());
             }
         }
 
         self.previous_level
-            .store(level, std::sync::atomic::Ordering::Release);
+            .store(level as u8, std::sync::atomic::Ordering::Release);
 
         let (text, newline) = text.split_at(text.len() - 1);
         debug_assert_eq!(newline, "\n");
 
         match level {
-            llama_cpp_sys_2::GGML_LOG_LEVEL_NONE => {
+            LogLevel::None => {
                 // TODO: Support logging this to stdout directly via options?
                 tracing::info!(no_log_level = true, text);
             }
-            llama_cpp_sys_2::GGML_LOG_LEVEL_DEBUG
-            | llama_cpp_sys_2::GGML_LOG_LEVEL_INFO
-            | llama_cpp_sys_2::GGML_LOG_LEVEL_WARN
-            | llama_cpp_sys_2::GGML_LOG_LEVEL_ERROR => Self::generate_log(self.module, level, text),
-            llama_cpp_sys_2::GGML_LOG_LEVEL_CONT => unreachable!(),
-            _ => {
+            LogLevel::Debug | LogLevel::Info | LogLevel::Warn | LogLevel::Error => {
+                Self::generate_log(self.module, level, text);
+            }
+            LogLevel::Cont => unreachable!(),
+            LogLevel::Unknown => {
                 tracing::warn!(
-                    level = level,
+                    level = raw_level,
                     text = text,
                     origin = "crate",
                     "Unknown llama.cpp log level"
@@ -266,18 +305,22 @@ impl State {
         &self,
         level: llama_cpp_sys_2::ggml_log_level,
     ) {
-        if level != llama_cpp_sys_2::GGML_LOG_LEVEL_CONT {
+        let level = LogLevel::from_raw(level);
+        if level != LogLevel::Cont {
             self.previous_level
-                .store(level, std::sync::atomic::Ordering::Release);
+                .store(level as u8, std::sync::atomic::Ordering::Release);
         }
     }
 
     /// Checks whether the given log level is enabled by the current tracing subscriber.
     pub(super) fn is_enabled_for_level(&self, level: llama_cpp_sys_2::ggml_log_level) -> bool {
+        let level = LogLevel::from_raw(level);
         // CONT logs do not need to check if they are enabled.
-        let level = if level == llama_cpp_sys_2::GGML_LOG_LEVEL_CONT {
-            self.previous_level
-                .load(std::sync::atomic::Ordering::Relaxed)
+        let level = if level == LogLevel::Cont {
+            LogLevel::from_stored(
+                self.previous_level
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            )
         } else {
             level
         };

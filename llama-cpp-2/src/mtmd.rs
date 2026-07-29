@@ -65,16 +65,16 @@ pub enum MtmdInputChunkType {
     /// Audio input chunk
     Audio,
     /// A chunk type introduced by a newer llama.cpp revision.
-    Unknown(u32),
+    Unknown(i64),
 }
 
 impl MtmdInputChunkType {
-    fn from_raw(chunk_type: u32) -> Self {
+    fn from_raw(chunk_type: llama_cpp_sys_2::mtmd_input_chunk_type) -> Self {
         match chunk_type {
             llama_cpp_sys_2::MTMD_INPUT_CHUNK_TYPE_TEXT => Self::Text,
             llama_cpp_sys_2::MTMD_INPUT_CHUNK_TYPE_IMAGE => Self::Image,
             llama_cpp_sys_2::MTMD_INPUT_CHUNK_TYPE_AUDIO => Self::Audio,
-            raw => Self::Unknown(raw),
+            raw => Self::Unknown(i64::from(raw)),
         }
     }
 }
@@ -1674,7 +1674,7 @@ pub enum MtmdInputChunkError {
     #[error("unsupported MTMD input chunk type: {raw}")]
     UnsupportedType {
         /// Raw native enum value.
-        raw: u32,
+        raw: i64,
     },
     /// A native chunk ID was not valid UTF-8.
     #[error("MTMD input chunk ID is not valid UTF-8: {0}")]
@@ -1738,7 +1738,7 @@ pub enum MtmdEncodeError {
     #[error("unsupported MTMD input chunk type: {raw}")]
     UnsupportedType {
         /// Raw native enum value.
-        raw: u32,
+        raw: i64,
     },
     /// Encode operation failed
     #[error("Encode failed with code: {0}")]
@@ -1767,7 +1767,7 @@ pub enum MtmdEvalError {
     #[error("unsupported MTMD input chunk type: {raw}")]
     UnsupportedType {
         /// Raw native enum value.
-        raw: u32,
+        raw: i64,
     },
     /// Evaluation operation failed
     #[error("Eval failed with code: {0}")]

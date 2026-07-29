@@ -95,7 +95,7 @@ pub enum LlamaMemoryBreakdownError {
     InvalidEntry(usize),
     /// The report contained a location kind unknown to this binding.
     #[error("llama.cpp returned an unknown resident-memory location {0}")]
-    UnknownLocation(u32),
+    UnknownLocation(i64),
 }
 
 /// A thread-safe cancellation handle for an installed llama.cpp abort callback.
@@ -744,7 +744,9 @@ impl<'model> LlamaContext<'model> {
                     physical_id: (!entry.device_id.is_null()).then(|| text(entry.device_id)),
                     native_index: entry.native_index,
                 },
-                other => return Err(LlamaMemoryBreakdownError::UnknownLocation(other)),
+                other => {
+                    return Err(LlamaMemoryBreakdownError::UnknownLocation(i64::from(other)));
+                }
             };
             result.push(LlamaMemoryBreakdown {
                 location,

@@ -1,6 +1,6 @@
 //! Typed diagnostics for llama.cpp's `common/fit` estimator.
 
-use std::ffi::{CStr, c_char};
+use std::ffi::{c_char, CStr};
 use std::mem::MaybeUninit;
 use std::pin::Pin;
 use std::ptr::{self, NonNull};
@@ -373,17 +373,17 @@ impl FitDeviceEstimate {
     /// Typed backend device class corresponding to [`Self::backend_type`].
     #[must_use]
     pub fn backend_device_type(&self) -> crate::LlamaBackendDeviceType {
-        match self.backend_type {
-            value if value == sys::GGML_BACKEND_DEVICE_TYPE_CPU.cast_signed() => {
+        match i64::from(self.backend_type) {
+            value if value == i64::from(sys::GGML_BACKEND_DEVICE_TYPE_CPU) => {
                 crate::LlamaBackendDeviceType::Cpu
             }
-            value if value == sys::GGML_BACKEND_DEVICE_TYPE_ACCEL.cast_signed() => {
+            value if value == i64::from(sys::GGML_BACKEND_DEVICE_TYPE_ACCEL) => {
                 crate::LlamaBackendDeviceType::Accelerator
             }
-            value if value == sys::GGML_BACKEND_DEVICE_TYPE_GPU.cast_signed() => {
+            value if value == i64::from(sys::GGML_BACKEND_DEVICE_TYPE_GPU) => {
                 crate::LlamaBackendDeviceType::Gpu
             }
-            value if value == sys::GGML_BACKEND_DEVICE_TYPE_IGPU.cast_signed() => {
+            value if value == i64::from(sys::GGML_BACKEND_DEVICE_TYPE_IGPU) => {
                 crate::LlamaBackendDeviceType::IntegratedGpu
             }
             _ => crate::LlamaBackendDeviceType::Unknown,
@@ -531,7 +531,7 @@ pub enum FitReportError {
         /// Enum being decoded.
         kind: &'static str,
         /// Raw enum value.
-        value: i32,
+        value: i64,
     },
     /// A derived byte count could not be represented by the public DTO.
     #[error("fit report arithmetic overflow while calculating {field}")]
@@ -1209,7 +1209,7 @@ fn decode_tensor_workload(
         value => {
             return Err(FitReportError::UnknownEnum {
                 kind: "fit tensor workload kind",
-                value: value.cast_signed(),
+                value: i64::from(value),
             });
         }
     };
@@ -1313,7 +1313,7 @@ fn decode_device(
         value => {
             return Err(FitReportError::UnknownEnum {
                 kind: "fit device kind",
-                value: value.cast_signed(),
+                value: i64::from(value),
             });
         }
     };
@@ -1420,7 +1420,7 @@ fn decode_placement(
         value => {
             return Err(FitReportError::UnknownEnum {
                 kind: "fit placement kind",
-                value: value.cast_signed(),
+                value: i64::from(value),
             });
         }
     };
@@ -1528,7 +1528,7 @@ fn decode_status(value: sys::llama_rs_fit_status) -> Result<FitStatus, FitReport
         sys::LLAMA_RS_FIT_STATUS_ERROR => Ok(FitStatus::Error),
         value => Err(FitReportError::UnknownEnum {
             kind: "fit status",
-            value: value.cast_signed(),
+            value: i64::from(value),
         }),
     }
 }
