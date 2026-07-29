@@ -892,9 +892,10 @@ fn main() {
     if matches!(target_os, TargetOs::Linux)
         && target_triple.contains("aarch64")
         && target_cpu != Some("native".into())
+        && !cfg!(feature = "dynamic-backends")
     {
         // If the target-cpu is not specified as native, we take off the native ARM64 support.
-        // It is useful in docker environments where the native feature is not enabled.
+        // Dynamic backend builds select portable ARM variants instead.
         config.define("GGML_NATIVE", "OFF");
         config.define("GGML_CPU_ARM_ARCH", "armv8-a");
     }
