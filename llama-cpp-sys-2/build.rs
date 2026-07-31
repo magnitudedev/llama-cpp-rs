@@ -663,7 +663,12 @@ fn main() {
             "OFF"
         },
     );
+    // Magnitude owns network transport outside llama.cpp. Keep every cpp-httplib TLS backend
+    // disabled so an ambient OpenSSL installation cannot change the runtime dependency closure.
     config.define("LLAMA_CURL", "OFF");
+    config.define("LLAMA_OPENSSL", "OFF");
+    config.define("LLAMA_BUILD_BORINGSSL", "OFF");
+    config.define("LLAMA_BUILD_LIBRESSL", "OFF");
 
     // Pass CMAKE_ environment variables down to CMake
     for (key, value) in env::vars() {
