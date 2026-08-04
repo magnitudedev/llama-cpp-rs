@@ -226,10 +226,42 @@ static ggml_backend_dev_t llama_rs_fit_tensor_device(const ggml_tensor * tensor)
     return ggml_backend_buft_get_device(buft);
 }
 
+struct llama_rs_fit_device_facts {
+    int32_t backend_type = 0;
+    std::string backend;
+    std::string device_id;
+};
+
+static llama_rs_fit_device_facts llama_rs_fit_resolve_device_facts(ggml_backend_dev_t device) {
+    llama_rs_fit_device_facts facts;
+    facts.backend_type = static_cast<int32_t>(ggml_backend_dev_type(device));
+    facts.backend = llama_rs_fit_backend_name(device);
+    facts.device_id = llama_rs_fit_device_id(device);
+    return facts;
+}
+
+class llama_rs_fit_device_facts_cache {
+public:
+    const llama_rs_fit_device_facts & get(ggml_backend_dev_t device) {
+        const auto found = std::find_if(
+            entries.begin(),
+            entries.end(),
+            [device](const auto & entry) { return entry.first == device; });
+        if (found != entries.end()) {
+            return found->second;
+        }
+        return entries.emplace_back(device, llama_rs_fit_resolve_device_facts(device)).second;
+    }
+
+private:
+    std::vector<std::pair<ggml_backend_dev_t, llama_rs_fit_device_facts>> entries;
+};
+
 static struct llama_rs_fit_decode_workload_storage llama_rs_fit_extract_decode_workload(
     const llama_model * model,
     const llama_context_params * cparams) {
     llama_rs_fit_decode_workload_storage result;
+    llama_rs_fit_device_facts_cache device_facts;
     result.architecture = model->arch_name();
     result.expert_count = model->hparams.n_expert;
     result.expert_used_count = model->hparams.n_expert_used;
@@ -253,11 +285,12 @@ static struct llama_rs_fit_decode_workload_storage llama_rs_fit_extract_decode_w
             result.unavailable_reason = "a model tensor has no native buffer device";
             return result;
         }
+        const auto & facts = device_facts.get(device);
         llama_rs_fit_tensor_workload_storage output;
         output.name = entry.first;
-        output.backend_type = static_cast<int32_t>(ggml_backend_dev_type(device));
-        output.backend = llama_rs_fit_backend_name(device);
-        output.device_id = llama_rs_fit_device_id(device);
+        output.backend_type = facts.backend_type;
+        output.backend = facts.backend;
+        output.device_id = facts.device_id;
         output.tensor_type = static_cast<int32_t>(tensor->type);
         output.baseline_executed = llama_rs_fit_is_baseline_tensor(
             entry.first.c_str(), model->hparams.n_layer());
@@ -288,11 +321,12 @@ static struct llama_rs_fit_decode_workload_storage llama_rs_fit_extract_decode_w
             result.tensors.clear();
             return result;
         }
+        const auto & facts = device_facts.get(device);
         llama_rs_fit_kv_layer_workload_storage output;
         output.layer = layer;
-        output.backend_type = static_cast<int32_t>(ggml_backend_dev_type(device));
-        output.backend = llama_rs_fit_backend_name(device);
-        output.device_id = llama_rs_fit_device_id(device);
+        output.backend_type = facts.backend_type;
+        output.backend = facts.backend;
+        output.device_id = facts.device_id;
         output.key_type = static_cast<int32_t>(cparams->type_k);
         output.value_type = static_cast<int32_t>(cparams->type_v);
         output.key_bytes_per_token = ggml_row_size(
