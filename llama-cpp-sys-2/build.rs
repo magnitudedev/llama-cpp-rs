@@ -289,6 +289,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=LLAMA_LIB_PROFILE");
     println!("cargo:rerun-if-env-changed=LLAMA_BUILD_SHARED_LIBS");
     println!("cargo:rerun-if-env-changed=LLAMA_STATIC_CRT");
+    println!("cargo:rerun-if-env-changed=LLAMA_CPU_ALL_VARIANTS");
 
     debug_log!("TARGET: {}", target_triple);
     debug_log!("CARGO_MANIFEST_DIR: {}", manifest_dir);
@@ -1020,7 +1021,13 @@ fn main() {
         let backends_dir = out_dir.join("backends");
         std::fs::create_dir_all(&backends_dir).unwrap();
         config.define("GGML_BACKEND_DL", "ON");
-        config.define("GGML_CPU_ALL_VARIANTS", "ON");
+        let cpu_all_variants = env::var("LLAMA_CPU_ALL_VARIANTS")
+            .map(|value| value == "1")
+            .unwrap_or(true);
+        config.define(
+            "GGML_CPU_ALL_VARIANTS",
+            if cpu_all_variants { "ON" } else { "OFF" },
+        );
         config.define("GGML_BACKEND_DIR", backends_dir.to_str().unwrap());
         // BUILD_SHARED_LIBS=ON is already set above via the dynamic-link feature.
     }
