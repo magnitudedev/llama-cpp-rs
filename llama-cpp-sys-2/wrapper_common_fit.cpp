@@ -112,6 +112,7 @@ struct llama_rs_fit_decode_workload_storage {
     uint32_t indexer_head_count = 0;
     uint32_t indexer_head_size = 0;
     uint32_t indexer_top_k = 0;
+    bool mla = false;
     bool hybrid_model = false;
     bool recurrent_model = false;
     std::vector<llama_rs_fit_tensor_workload_storage> tensors;
@@ -270,6 +271,7 @@ static struct llama_rs_fit_decode_workload_storage llama_rs_fit_extract_decode_w
     result.indexer_head_count = model->hparams.indexer_n_head;
     result.indexer_head_size = model->hparams.indexer_head_size;
     result.indexer_top_k = model->hparams.indexer_top_k;
+    result.mla = model->hparams.is_mla();
     result.hybrid_model = llama_model_is_hybrid(model);
     result.recurrent_model = llama_model_is_recurrent(model);
 
@@ -1425,6 +1427,7 @@ extern "C" bool llama_rs_fit_report_get_decode_workload_summary(
     out_summary->indexer_head_count = source.indexer_head_count;
     out_summary->indexer_head_size = source.indexer_head_size;
     out_summary->indexer_top_k = source.indexer_top_k;
+    out_summary->mla = source.mla;
     out_summary->hybrid_model = source.hybrid_model;
     out_summary->recurrent_model = source.recurrent_model;
     return true;

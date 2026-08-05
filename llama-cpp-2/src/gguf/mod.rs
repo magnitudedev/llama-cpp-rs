@@ -129,6 +129,28 @@ pub enum FileTypeNameError {
     InvalidUtf8(#[from] std::str::Utf8Error),
 }
 
+/// Return the exact contiguous storage required by one GGML tensor shape.
+///
+/// This is pure shape arithmetic over the pinned GGML type table. It does not initialize a backend,
+/// open a model, or allocate tensor storage. `dimensions` are in GGML order, with the quantized row
+/// width first.
+#[must_use]
+pub fn tensor_storage_bytes(tensor_type: u32, dimensions: &[u64]) -> Option<u64> {
+    if tensor_type >= llama_cpp_sys_2::GGML_TYPE_COUNT || dimensions.is_empty() {
+        return None;
+    }
+    let row_elements = i64::try_from(dimensions[0]).ok()?;
+    let block_size = unsafe { llama_cpp_sys_2::ggml_blck_size(tensor_type) };
+    if row_elements <= 0 || block_size <= 0 || row_elements % block_size != 0 {
+        return None;
+    }
+    let row_bytes =
+        u64::try_from(unsafe { llama_cpp_sys_2::ggml_row_size(tensor_type, row_elements) }).ok()?;
+    dimensions[1..]
+        .iter()
+        .try_fold(row_bytes, |bytes, dimension| bytes.checked_mul(*dimension))
+}
+
 /// A safe wrapper around `gguf_context`.
 ///
 /// Opens a GGUF file and parses only the metadata header; tensor weights are

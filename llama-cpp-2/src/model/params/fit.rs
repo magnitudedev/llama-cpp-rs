@@ -194,7 +194,38 @@ pub struct FitTensorWorkload {
     pub operation_bytes: u64,
 }
 
-/// Native KV facts for one fitted model layer.
+/// One concrete attention row read for every occupied token.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
+pub struct FitAttentionRowWorkload {
+    /// Raw cache `ggml_type`.
+    pub tensor_type: i32,
+    /// Native row bytes for one occupied token.
+    pub bytes_per_token: u64,
+}
+
+/// Architecture-specific attention storage for one fitted layer.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
+#[cfg_attr(feature = "serde", serde(tag = "kind", rename_all = "snake_case"))]
+pub enum FitAttentionWorkload {
+    /// The layer has no context-dependent attention storage.
+    None,
+    /// Ordinary attention stores independently typed K and V rows.
+    Conventional {
+        /// Key-cache row.
+        key: FitAttentionRowWorkload,
+        /// Value-cache row.
+        value: FitAttentionRowWorkload,
+    },
+    /// Multi-head latent attention stores one latent row.
+    Mla {
+        /// Latent attention-cache row.
+        latent: FitAttentionRowWorkload,
+    },
+}
+
+/// Native attention and recurrent facts for one fitted model layer.
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct FitKvLayerWorkload {
@@ -206,14 +237,8 @@ pub struct FitKvLayerWorkload {
     pub backend: String,
     /// Backend-reported physical device identity, when available.
     pub device_id: Option<String>,
-    /// Raw K-cache `ggml_type`.
-    pub key_type: i32,
-    /// Raw V-cache `ggml_type`.
-    pub value_type: i32,
-    /// Native K row bytes for one occupied token, or zero when the layer has no attention K row.
-    pub key_bytes_per_token: u64,
-    /// Native V row bytes for one occupied token, or zero when the layer has no attention V row.
-    pub value_bytes_per_token: u64,
+    /// Complete attention storage shape for this architecture.
+    pub attention: FitAttentionWorkload,
     /// Native attention key-head width used by architecture-specific cache state.
     pub attention_head_size: u32,
     /// Raw `ggml_type` of architecture-specific fixed attention state.
@@ -1169,7 +1194,7 @@ fn decode_workload(
             requested: layer_count,
         })?;
     for index in 0..layer_count {
-        kv_layers.push(decode_kv_layer_workload(native, index)?);
+        kv_layers.push(decode_kv_layer_workload(native, index, raw.mla)?);
     }
 
     Ok(FitDecodeWorkloadAssessment::Available {
@@ -1234,6 +1259,7 @@ fn decode_tensor_workload(
 fn decode_kv_layer_workload(
     native: &NativeFitReport,
     index: usize,
+    mla: bool,
 ) -> Result<FitKvLayerWorkload, FitReportError> {
     let mut raw = MaybeUninit::<sys::llama_rs_fit_kv_layer_workload>::uninit();
     if !unsafe {
@@ -1244,11 +1270,13 @@ fn decode_kv_layer_workload(
         ));
     }
     let raw = unsafe { raw.assume_init() };
-    if !valid_kv_row_bytes(raw.key_bytes_per_token, raw.value_bytes_per_token) {
-        return Err(FitReportError::Malformed(
-            "decode KV layer workload has incomplete row bytes",
-        ));
-    }
+    let attention = decode_attention_workload(
+        raw.key_type,
+        raw.value_type,
+        raw.key_bytes_per_token,
+        raw.value_bytes_per_token,
+        mla,
+    )?;
     Ok(FitKvLayerWorkload {
         layer: raw.layer,
         backend_type: raw.backend_type,
@@ -1257,10 +1285,7 @@ fn decode_kv_layer_workload(
             raw.device_id,
             "decode_workload.kv_layers[].device_id",
         )?,
-        key_type: raw.key_type,
-        value_type: raw.value_type,
-        key_bytes_per_token: raw.key_bytes_per_token,
-        value_bytes_per_token: raw.value_bytes_per_token,
+        attention,
         attention_head_size: raw.attention_head_size,
         attention_state_type: raw.attention_state_type,
         sliding_window_tokens: raw.sliding_window_tokens,
@@ -1274,8 +1299,37 @@ fn decode_kv_layer_workload(
     })
 }
 
-fn valid_kv_row_bytes(key_bytes: u64, value_bytes: u64) -> bool {
-    (key_bytes == 0) == (value_bytes == 0)
+fn decode_attention_workload(
+    key_type: i32,
+    value_type: i32,
+    key_bytes: u64,
+    value_bytes: u64,
+    mla: bool,
+) -> Result<FitAttentionWorkload, FitReportError> {
+    match (mla, key_bytes, value_bytes) {
+        (true, key_bytes, 0) if key_bytes > 0 => Ok(FitAttentionWorkload::Mla {
+            latent: FitAttentionRowWorkload {
+                tensor_type: key_type,
+                bytes_per_token: key_bytes,
+            },
+        }),
+        (false, 0, 0) => Ok(FitAttentionWorkload::None),
+        (false, key_bytes, value_bytes) if key_bytes > 0 && value_bytes > 0 => {
+            Ok(FitAttentionWorkload::Conventional {
+                key: FitAttentionRowWorkload {
+                    tensor_type: key_type,
+                    bytes_per_token: key_bytes,
+                },
+                value: FitAttentionRowWorkload {
+                    tensor_type: value_type,
+                    bytes_per_token: value_bytes,
+                },
+            })
+        }
+        _ => Err(FitReportError::Malformed(
+            "decode attention workload does not match its architecture",
+        )),
+    }
 }
 
 fn decode_configurations(
@@ -1697,10 +1751,12 @@ mod tests {
 
     #[test]
     fn kv_row_bytes_are_both_present_or_both_absent() {
-        assert!(valid_kv_row_bytes(0, 0));
-        assert!(valid_kv_row_bytes(8, 8));
-        assert!(!valid_kv_row_bytes(0, 8));
-        assert!(!valid_kv_row_bytes(8, 0));
+        assert!(decode_attention_workload(1, 1, 0, 0, false).is_ok());
+        assert!(decode_attention_workload(1, 1, 8, 8, false).is_ok());
+        assert!(decode_attention_workload(1, 1, 0, 8, false).is_err());
+        assert!(decode_attention_workload(1, 1, 8, 0, false).is_err());
+        assert!(decode_attention_workload(1, 1, 8, 0, true).is_ok());
+        assert!(decode_attention_workload(1, 1, 8, 8, true).is_err());
     }
 
     #[test]

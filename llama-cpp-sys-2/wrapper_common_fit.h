@@ -111,6 +111,7 @@ typedef struct llama_rs_fit_decode_workload_summary {
     uint32_t indexer_head_count;
     uint32_t indexer_head_size;
     uint32_t indexer_top_k;
+    bool mla;
     bool hybrid_model;
     bool recurrent_model;
 } llama_rs_fit_decode_workload_summary;
