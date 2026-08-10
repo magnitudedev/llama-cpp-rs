@@ -27,8 +27,7 @@ pub struct MtpPreflightParams<'a> {
 
 /// A successfully validated MTP artifact configuration.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct MtpPreflight {
-}
+pub struct MtpPreflight {}
 
 /// Failure to validate an MTP artifact configuration.
 #[derive(Debug, Eq, PartialEq, thiserror::Error)]

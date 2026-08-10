@@ -13,8 +13,8 @@ using speculative_ptr = std::unique_ptr<llama_rs_mtp_speculative, decltype(&llam
 model_ptr load_model_no_alloc(const char * path, const llama_model_params & source) {
     llama_model_params params = source;
     params.no_alloc = true;
-    params.use_mmap = false;
-    params.use_mlock = false;
+    params.load_mode = LLAMA_LOAD_MODE_NONE;
+    params.load_mtp = true;
     model_ptr model(llama_model_load_from_file(path, params), llama_model_free);
     if (!model) {
         throw std::runtime_error("failed to inspect GGUF model");

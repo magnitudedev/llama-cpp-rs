@@ -443,12 +443,7 @@ impl CommonChatTemplates {
         let template = CString::new(template)?;
         let bos = optional_c_string(bos_token)?;
         let eos = optional_c_string(eos_token)?;
-        Self::init(
-            ptr::null(),
-            Some(&template),
-            bos.as_ref(),
-            eos.as_ref(),
-        )
+        Self::init(ptr::null(), Some(&template), bos.as_ref(), eos.as_ref())
     }
 
     fn init(

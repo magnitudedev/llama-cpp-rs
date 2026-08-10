@@ -1083,8 +1083,7 @@ static llama_rs_status llama_rs_fit_report_create_impl(
         if (has_linked_target) {
             llama_model_params linked_mparams = *target_mparams;
             linked_mparams.no_alloc = true;
-            linked_mparams.use_mmap = false;
-            linked_mparams.use_mlock = false;
+            linked_mparams.load_mode = LLAMA_LOAD_MODE_NONE;
             linked_model.reset(llama_model_load_from_file(target_path, linked_mparams));
             if (!linked_model) {
                 throw std::runtime_error("failed to inspect linked fit target model");
@@ -1153,8 +1152,7 @@ static llama_rs_status llama_rs_fit_report_create_impl(
         if (fit_status == COMMON_PARAMS_FIT_STATUS_SUCCESS && capture_decode_workload) {
             llama_model_params workload_mparams = *mparams;
             workload_mparams.no_alloc = true;
-            workload_mparams.use_mmap = false;
-            workload_mparams.use_mlock = false;
+            workload_mparams.load_mode = LLAMA_LOAD_MODE_NONE;
             std::unique_ptr<llama_model, decltype(&llama_model_free)> workload_model(
                 llama_model_load_from_file(path_model, workload_mparams), llama_model_free);
             if (workload_model) {
@@ -1212,8 +1210,7 @@ extern "C" llama_rs_status llama_rs_fit_measure_reports_create(
     try {
         llama_model_params loading = *mparams;
         loading.no_alloc = true;
-        loading.use_mmap = false;
-        loading.use_mlock = false;
+        loading.load_mode = LLAMA_LOAD_MODE_NONE;
         std::unique_ptr<llama_model, decltype(&llama_model_free)> model(
             llama_model_load_from_file(path_model, loading), llama_model_free);
         if (!model) {

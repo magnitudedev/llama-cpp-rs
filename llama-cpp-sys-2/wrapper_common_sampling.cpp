@@ -360,7 +360,9 @@ static void llama_rs_common_sampler_apply_config(
             params.reasoning_budget_start = common_tokenize(vocab, start_tag, false, true);
         }
         if (end_tag[0] != '\0') {
-            params.reasoning_budget_end = common_tokenize(vocab, end_tag, false, true);
+            params.reasoning_budget_end = {
+                common_tokenize(vocab, end_tag, false, true),
+            };
             params.reasoning_budget_forced = common_tokenize(
                 vocab,
                 std::string(message) + end_tag,

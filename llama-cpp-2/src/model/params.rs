@@ -231,8 +231,9 @@ impl Debug for LlamaModelParams {
             .field("n_gpu_layers", &self.params.n_gpu_layers)
             .field("main_gpu", &self.params.main_gpu)
             .field("vocab_only", &self.params.vocab_only)
-            .field("use_mmap", &self.params.use_mmap)
-            .field("use_mlock", &self.params.use_mlock)
+            .field("load_mtp", &self.load_mtp())
+            .field("use_mmap", &self.use_mmap())
+            .field("use_mlock", &self.use_mlock())
             .field("split_mode", &self.split_mode())
             .field("devices", &self.devices)
             .field("kv_overrides", &"vec of kv_overrides")
@@ -501,13 +502,19 @@ impl LlamaModelParams {
     /// use mmap if possible
     #[must_use]
     pub fn use_mmap(&self) -> bool {
-        self.params.use_mmap
+        matches!(
+            self.params.load_mode,
+            llama_cpp_sys_2::LLAMA_LOAD_MODE_MMAP | llama_cpp_sys_2::LLAMA_LOAD_MODE_MMAP_MLOCK
+        )
     }
 
     /// force system to keep model in RAM
     #[must_use]
     pub fn use_mlock(&self) -> bool {
-        self.params.use_mlock
+        matches!(
+            self.params.load_mode,
+            llama_cpp_sys_2::LLAMA_LOAD_MODE_MLOCK | llama_cpp_sys_2::LLAMA_LOAD_MODE_MMAP_MLOCK
+        )
     }
 
     /// get the split mode
@@ -581,17 +588,40 @@ impl LlamaModelParams {
         self
     }
 
+    /// Sets whether model loading includes multi-token-prediction layers.
+    #[must_use]
+    pub fn with_load_mtp(mut self, load_mtp: bool) -> Self {
+        self.params.load_mtp = load_mtp;
+        self
+    }
+
+    /// Returns whether model loading includes multi-token-prediction layers.
+    #[must_use]
+    pub fn load_mtp(&self) -> bool {
+        self.params.load_mtp
+    }
+
     /// sets `use_mmap`
     #[must_use]
     pub fn with_use_mmap(mut self, use_mmap: bool) -> Self {
-        self.params.use_mmap = use_mmap;
+        self.params.load_mode = match (use_mmap, self.use_mlock()) {
+            (false, false) => llama_cpp_sys_2::LLAMA_LOAD_MODE_NONE,
+            (false, true) => llama_cpp_sys_2::LLAMA_LOAD_MODE_MLOCK,
+            (true, false) => llama_cpp_sys_2::LLAMA_LOAD_MODE_MMAP,
+            (true, true) => llama_cpp_sys_2::LLAMA_LOAD_MODE_MMAP_MLOCK,
+        };
         self
     }
 
     /// sets `use_mlock`
     #[must_use]
     pub fn with_use_mlock(mut self, use_mlock: bool) -> Self {
-        self.params.use_mlock = use_mlock;
+        self.params.load_mode = match (self.use_mmap(), use_mlock) {
+            (false, false) => llama_cpp_sys_2::LLAMA_LOAD_MODE_NONE,
+            (false, true) => llama_cpp_sys_2::LLAMA_LOAD_MODE_MLOCK,
+            (true, false) => llama_cpp_sys_2::LLAMA_LOAD_MODE_MMAP,
+            (true, true) => llama_cpp_sys_2::LLAMA_LOAD_MODE_MMAP_MLOCK,
+        };
         self
     }
 
@@ -767,6 +797,32 @@ impl Default for LlamaModelParams {
 #[cfg(test)]
 mod tests {
     use super::{LlamaModelParams, TensorSplitError};
+
+    #[test]
+    fn mmap_and_mlock_preserve_each_other_in_load_mode() {
+        let params = LlamaModelParams::default();
+        assert!(params.use_mmap());
+        assert!(!params.use_mlock());
+
+        let params = params.with_use_mlock(true);
+        assert!(params.use_mmap());
+        assert!(params.use_mlock());
+
+        let params = params.with_use_mmap(false);
+        assert!(!params.use_mmap());
+        assert!(params.use_mlock());
+
+        let params = params.with_use_mlock(false);
+        assert!(!params.use_mmap());
+        assert!(!params.use_mlock());
+    }
+
+    #[test]
+    fn mtp_layer_loading_round_trips() {
+        let params = LlamaModelParams::default();
+        assert!(!params.load_mtp());
+        assert!(params.with_load_mtp(true).load_mtp());
+    }
 
     #[test]
     fn tensor_split_owns_and_pads_native_weights() {

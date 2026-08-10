@@ -639,9 +639,13 @@ extern "C" llama_rs_status llama_rs_chat_prepared_get_string(
         case LLAMA_RS_CHAT_PREPARED_THINKING_START_TAG:
             value = &prepared->value.thinking_start_tag;
             break;
-        case LLAMA_RS_CHAT_PREPARED_THINKING_END_TAG:
-            value = &prepared->value.thinking_end_tag;
+        case LLAMA_RS_CHAT_PREPARED_THINKING_END_TAG: {
+            static const std::string empty;
+            value = prepared->value.thinking_end_tags.empty()
+                ? &empty
+                : &prepared->value.thinking_end_tags.front();
             break;
+        }
         case LLAMA_RS_CHAT_PREPARED_PARSER:
             value = &prepared->value.parser;
             break;
