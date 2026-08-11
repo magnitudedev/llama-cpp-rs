@@ -1,6 +1,7 @@
 //! Experimental wrappers for llama.cpp speculative decoding helpers.
 
-use std::ptr::NonNull;
+use std::ffi::{c_char, CStr};
+use std::ptr::{self, NonNull};
 
 use crate::context::params::LlamaContextParams;
 use crate::context::LlamaContext;
@@ -31,6 +32,15 @@ impl Default for MtpSpeculativeParams {
     }
 }
 
+/// Result of resolving one target verification pass.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MtpVerificationResolution {
+    /// Target and draft state were restored; verify the accepted prefix again.
+    Replay,
+    /// The accepted prefix was committed to the native speculative state.
+    Committed,
+}
+
 /// Errors returned by the MTP speculative wrapper.
 #[derive(Debug, Eq, PartialEq, thiserror::Error)]
 pub enum MtpSpeculativeError {
@@ -41,8 +51,15 @@ pub enum MtpSpeculativeError {
     #[error("llama.cpp failed to initialize MTP speculative decoding")]
     InitFailed,
     /// llama.cpp rejected a wrapper call.
-    #[error("llama.cpp MTP speculative call failed with status {0}")]
-    Status(i32),
+    #[error("llama.cpp MTP {operation} failed with status {status}: {message}")]
+    Native {
+        /// Operation that failed.
+        operation: &'static str,
+        /// Native bridge status.
+        status: i32,
+        /// Native diagnostic text.
+        message: String,
+    },
     /// The draft output exceeded the caller-provided bound.
     #[error("llama.cpp MTP draft exceeded configured maximum")]
     DraftOverflow,
@@ -112,6 +129,7 @@ impl<'model> MtpSpeculative<'model> {
                 params.n_min,
                 params.p_min,
                 n_seq,
+                true,
             )
         };
         let raw = NonNull::new(raw).ok_or(MtpSpeculativeError::InitFailed)?;
@@ -184,15 +202,15 @@ impl<'model> MtpSpeculative<'model> {
     ) -> Result<(), MtpSpeculativeError> {
         self.validate_sequence(sequence_id)?;
         let prompt = tokens_to_raw(prompt_tokens);
-        let status = unsafe {
+        native_call("begin", |out_error| unsafe {
             llama_cpp_sys_2::llama_rs_mtp_speculative_begin(
                 self.raw.as_ptr(),
                 sequence_id,
                 prompt.as_ptr(),
                 prompt.len(),
+                out_error,
             )
-        };
-        status_to_result(status)
+        })
     }
 
     /// Process a batch that was just decoded by the target context.
@@ -203,13 +221,13 @@ impl<'model> MtpSpeculative<'model> {
     ///
     /// Returns an error if llama.cpp cannot update the MTP draft context.
     pub fn process(&mut self, batch: &LlamaBatch<'_>) -> Result<(), MtpSpeculativeError> {
-        let status = unsafe {
+        native_call("process", |out_error| unsafe {
             llama_cpp_sys_2::llama_rs_mtp_speculative_process(
                 self.raw.as_ptr(),
                 std::ptr::from_ref(&batch.raw),
+                out_error,
             )
-        };
-        status_to_result(status)
+        })
     }
 
     /// Generate draft tokens after `id_last`.
@@ -235,7 +253,8 @@ impl<'model> MtpSpeculative<'model> {
         }
 
         let prompt = tokens_to_raw(prompt_tokens);
-        let status = unsafe {
+        let n_max = i32::try_from(n_max).map_err(|_| MtpSpeculativeError::InvalidParams)?;
+        native_call("prepare draft", |out_error| unsafe {
             llama_cpp_sys_2::llama_rs_mtp_speculative_prepare_draft(
                 self.raw.as_ptr(),
                 sequence_id,
@@ -243,16 +262,17 @@ impl<'model> MtpSpeculative<'model> {
                 id_last.0,
                 prompt.as_ptr(),
                 prompt.len(),
-                i32::try_from(n_max).map_err(|_| MtpSpeculativeError::InvalidParams)?,
+                n_max,
+                out_error,
             )
-        };
-        status_to_result(status)
+        })
     }
 
     /// Generate every sequence draft prepared with [`Self::prepare_draft`].
     pub fn draft_all(&mut self) -> Result<(), MtpSpeculativeError> {
-        let status = unsafe { llama_cpp_sys_2::llama_rs_mtp_speculative_draft(self.raw.as_ptr()) };
-        status_to_result(status)
+        native_call("draft", |out_error| unsafe {
+            llama_cpp_sys_2::llama_rs_mtp_speculative_draft(self.raw.as_ptr(), out_error)
+        })
     }
 
     /// Copy the most recently generated draft for one sequence.
@@ -260,6 +280,7 @@ impl<'model> MtpSpeculative<'model> {
         self.validate_sequence(sequence_id)?;
         let mut raw_out = vec![0; self.n_max];
         let mut out_len = 0_usize;
+        let mut native_error = ptr::null_mut();
         let status = unsafe {
             llama_cpp_sys_2::llama_rs_mtp_speculative_get_draft(
                 self.raw.as_ptr(),
@@ -267,31 +288,34 @@ impl<'model> MtpSpeculative<'model> {
                 raw_out.as_mut_ptr(),
                 raw_out.len(),
                 &raw mut out_len,
+                &raw mut native_error,
             )
         };
         if status == llama_cpp_sys_2::LLAMA_RS_STATUS_ALLOCATION_FAILED {
+            take_native_error(native_error);
             return Err(MtpSpeculativeError::DraftOverflow);
         }
-        status_to_result(status)?;
+        status_to_result("get draft", status, native_error)?;
         raw_out.truncate(out_len);
         Ok(raw_out.into_iter().map(LlamaToken).collect())
     }
 
-    /// Notify llama.cpp how many draft tokens the target context accepted.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if llama.cpp rejects the call.
-    pub fn accept(&mut self, sequence_id: i32, n_accepted: u16) -> Result<(), MtpSpeculativeError> {
+    /// Atomically commit a verified prefix or restore the checkpoint for replay.
+    pub fn resolve_verification(
+        &mut self,
+        sequence_id: i32,
+        proposed_count: usize,
+        accepted_count: usize,
+        next_position: i32,
+    ) -> Result<MtpVerificationResolution, MtpSpeculativeError> {
         self.validate_sequence(sequence_id)?;
-        let status = unsafe {
-            llama_cpp_sys_2::llama_rs_mtp_speculative_accept(
-                self.raw.as_ptr(),
-                sequence_id,
-                n_accepted,
-            )
-        };
-        status_to_result(status)
+        resolve_verification(
+            self.raw.as_ptr(),
+            sequence_id,
+            proposed_count,
+            accepted_count,
+            next_position,
+        )
     }
 
     fn validate_sequence(&self, sequence_id: i32) -> Result<(), MtpSpeculativeError> {
@@ -318,22 +342,24 @@ impl MtpOperations<'_> {
     ) -> Result<(), MtpSpeculativeError> {
         validate_sequence(self.n_seq, sequence_id)?;
         let prompt = tokens_to_raw(prompt_tokens);
-        status_to_result(unsafe {
+        native_call("begin", |out_error| unsafe {
             llama_cpp_sys_2::llama_rs_mtp_speculative_begin(
                 self.raw.as_ptr(),
                 sequence_id,
                 prompt.as_ptr(),
                 prompt.len(),
+                out_error,
             )
         })
     }
 
     /// Mirror a target batch into the linked MTP context.
     pub fn process(&mut self, batch: &LlamaBatch<'_>) -> Result<(), MtpSpeculativeError> {
-        status_to_result(unsafe {
+        native_call("process", |out_error| unsafe {
             llama_cpp_sys_2::llama_rs_mtp_speculative_process(
                 self.raw.as_ptr(),
                 std::ptr::from_ref(&batch.raw),
+                out_error,
             )
         })
     }
@@ -352,7 +378,8 @@ impl MtpOperations<'_> {
             return Err(MtpSpeculativeError::InvalidParams);
         }
         let prompt = tokens_to_raw(prompt_tokens);
-        status_to_result(unsafe {
+        let n_max = i32::try_from(n_max).map_err(|_| MtpSpeculativeError::InvalidParams)?;
+        native_call("prepare draft", |out_error| unsafe {
             llama_cpp_sys_2::llama_rs_mtp_speculative_prepare_draft(
                 self.raw.as_ptr(),
                 sequence_id,
@@ -360,15 +387,16 @@ impl MtpOperations<'_> {
                 id_last.0,
                 prompt.as_ptr(),
                 prompt.len(),
-                i32::try_from(n_max).map_err(|_| MtpSpeculativeError::InvalidParams)?,
+                n_max,
+                out_error,
             )
         })
     }
 
     /// Generate drafts for all sequences registered by [`Self::prepare_draft`].
     pub fn draft_all(&mut self) -> Result<(), MtpSpeculativeError> {
-        status_to_result(unsafe {
-            llama_cpp_sys_2::llama_rs_mtp_speculative_draft(self.raw.as_ptr())
+        native_call("draft", |out_error| unsafe {
+            llama_cpp_sys_2::llama_rs_mtp_speculative_draft(self.raw.as_ptr(), out_error)
         })
     }
 
@@ -377,6 +405,7 @@ impl MtpOperations<'_> {
         validate_sequence(self.n_seq, sequence_id)?;
         let mut raw_out = vec![0; self.n_max];
         let mut out_len = 0;
+        let mut native_error = ptr::null_mut();
         let status = unsafe {
             llama_cpp_sys_2::llama_rs_mtp_speculative_get_draft(
                 self.raw.as_ptr(),
@@ -384,26 +413,34 @@ impl MtpOperations<'_> {
                 raw_out.as_mut_ptr(),
                 raw_out.len(),
                 &raw mut out_len,
+                &raw mut native_error,
             )
         };
         if status == llama_cpp_sys_2::LLAMA_RS_STATUS_ALLOCATION_FAILED {
+            take_native_error(native_error);
             return Err(MtpSpeculativeError::DraftOverflow);
         }
-        status_to_result(status)?;
+        status_to_result("get draft", status, native_error)?;
         raw_out.truncate(out_len);
         Ok(raw_out.into_iter().map(LlamaToken).collect())
     }
 
-    /// Commit the accepted prefix of a sequence's pending draft.
-    pub fn accept(&mut self, sequence_id: i32, n_accepted: u16) -> Result<(), MtpSpeculativeError> {
+    /// Atomically commit a verified prefix or restore the checkpoint for replay.
+    pub fn resolve_verification(
+        &mut self,
+        sequence_id: i32,
+        proposed_count: usize,
+        accepted_count: usize,
+        next_position: i32,
+    ) -> Result<MtpVerificationResolution, MtpSpeculativeError> {
         validate_sequence(self.n_seq, sequence_id)?;
-        status_to_result(unsafe {
-            llama_cpp_sys_2::llama_rs_mtp_speculative_accept(
-                self.raw.as_ptr(),
-                sequence_id,
-                n_accepted,
-            )
-        })
+        resolve_verification(
+            self.raw.as_ptr(),
+            sequence_id,
+            proposed_count,
+            accepted_count,
+            next_position,
+        )
     }
 
     /// Remove the same position range from both target and draft memories.
@@ -414,12 +451,13 @@ impl MtpOperations<'_> {
         end: i32,
     ) -> Result<(), MtpSpeculativeError> {
         validate_sequence(self.n_seq, sequence_id)?;
-        status_to_result(unsafe {
+        native_call("remove sequence range", |out_error| unsafe {
             llama_cpp_sys_2::llama_rs_mtp_speculative_seq_rm(
                 self.raw.as_ptr(),
                 sequence_id,
                 start,
                 end,
+                out_error,
             )
         })
     }
@@ -437,12 +475,74 @@ fn tokens_to_raw(tokens: &[LlamaToken]) -> Vec<llama_cpp_sys_2::llama_token> {
     tokens.iter().map(|token| token.0).collect()
 }
 
-fn status_to_result(status: llama_cpp_sys_2::llama_rs_status) -> Result<(), MtpSpeculativeError> {
+fn resolve_verification(
+    raw: *mut llama_cpp_sys_2::llama_rs_mtp_speculative,
+    sequence_id: i32,
+    proposed_count: usize,
+    accepted_count: usize,
+    next_position: i32,
+) -> Result<MtpVerificationResolution, MtpSpeculativeError> {
+    if proposed_count == 0 || accepted_count > proposed_count || next_position < 0 {
+        return Err(MtpSpeculativeError::InvalidParams);
+    }
+    let accepted_count =
+        u16::try_from(accepted_count).map_err(|_| MtpSpeculativeError::InvalidParams)?;
+    let mut replay = false;
+    native_call("resolve verification", |out_error| unsafe {
+        llama_cpp_sys_2::llama_rs_mtp_speculative_resolve(
+            raw,
+            sequence_id,
+            proposed_count,
+            accepted_count,
+            next_position,
+            &raw mut replay,
+            out_error,
+        )
+    })?;
+    Ok(if replay {
+        MtpVerificationResolution::Replay
+    } else {
+        MtpVerificationResolution::Committed
+    })
+}
+
+fn native_call(
+    operation: &'static str,
+    call: impl FnOnce(*mut *mut c_char) -> llama_cpp_sys_2::llama_rs_status,
+) -> Result<(), MtpSpeculativeError> {
+    let mut native_error = ptr::null_mut();
+    let status = call(&raw mut native_error);
+    status_to_result(operation, status, native_error)
+}
+
+fn status_to_result(
+    operation: &'static str,
+    status: llama_cpp_sys_2::llama_rs_status,
+    native_error: *mut c_char,
+) -> Result<(), MtpSpeculativeError> {
     if status_is_ok(status) {
+        if !native_error.is_null() {
+            unsafe { llama_cpp_sys_2::llama_rs_string_free(native_error) };
+        }
         Ok(())
     } else {
-        Err(MtpSpeculativeError::Status(status))
+        Err(MtpSpeculativeError::Native {
+            operation,
+            status,
+            message: take_native_error(native_error),
+        })
     }
+}
+
+fn take_native_error(native_error: *mut c_char) -> String {
+    if native_error.is_null() {
+        return "native bridge returned no diagnostic".to_owned();
+    }
+    let message = unsafe { CStr::from_ptr(native_error) }
+        .to_string_lossy()
+        .into_owned();
+    unsafe { llama_cpp_sys_2::llama_rs_string_free(native_error) };
+    message
 }
 
 fn validate_sequence(n_seq: u32, sequence_id: i32) -> Result<(), MtpSpeculativeError> {
@@ -450,5 +550,31 @@ fn validate_sequence(n_seq: u32, sequence_id: i32) -> Result<(), MtpSpeculativeE
         Err(MtpSpeculativeError::InvalidParams)
     } else {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn native_mtp_error_preserves_operation_status_and_message() {
+        let error = native_call("process", |out_error| unsafe {
+            llama_cpp_sys_2::llama_rs_mtp_speculative_process(
+                ptr::null_mut(),
+                ptr::null(),
+                out_error,
+            )
+        })
+        .unwrap_err();
+
+        assert_eq!(
+            error,
+            MtpSpeculativeError::Native {
+                operation: "process",
+                status: llama_cpp_sys_2::LLAMA_RS_STATUS_INVALID_ARGUMENT,
+                message: "invalid MTP process arguments".to_owned(),
+            }
+        );
     }
 }

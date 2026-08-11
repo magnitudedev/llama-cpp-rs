@@ -431,6 +431,60 @@ extern "C" void llama_rs_common_sampler_free(struct llama_rs_common_sampler * sa
     delete sampler;
 }
 
+extern "C" llama_rs_status llama_rs_common_sampler_clone(
+    const struct llama_rs_common_sampler * sampler,
+    struct llama_rs_common_sampler ** out_clone,
+    char ** out_error) {
+    if (out_error) {
+        *out_error = nullptr;
+    }
+    if (!sampler || !sampler->value || !out_clone) {
+        return llama_rs_chat_set_error(
+            out_error, LLAMA_RS_STATUS_INVALID_ARGUMENT, "sampler and out_clone must not be null");
+    }
+    *out_clone = nullptr;
+    try {
+        common_sampler_ptr native(common_sampler_clone(sampler->value));
+        if (!native) {
+            return llama_rs_chat_set_error(
+                out_error, LLAMA_RS_STATUS_EXCEPTION, "common_sampler_clone returned null");
+        }
+        auto clone = std::make_unique<llama_rs_common_sampler>(native.get(), sampler->n_vocab);
+        native.release();
+        clone->has_last = sampler->has_last;
+        clone->last = sampler->last;
+        *out_clone = clone.release();
+        return LLAMA_RS_STATUS_OK;
+    } catch (...) {
+        return llama_rs_chat_current_exception(out_error);
+    }
+}
+
+extern "C" llama_rs_status llama_rs_common_sampler_restore(
+    struct llama_rs_common_sampler * sampler,
+    const struct llama_rs_common_sampler * snapshot,
+    char ** out_error) {
+    if (out_error) {
+        *out_error = nullptr;
+    }
+    if (!sampler || !sampler->value || !snapshot || !snapshot->value) {
+        return llama_rs_chat_set_error(
+            out_error, LLAMA_RS_STATUS_INVALID_ARGUMENT, "sampler and snapshot must not be null");
+    }
+    if (sampler->n_vocab != snapshot->n_vocab) {
+        return llama_rs_chat_set_error(
+            out_error, LLAMA_RS_STATUS_INVALID_ARGUMENT, "sampler snapshot belongs to a different vocabulary");
+    }
+    try {
+        common_sampler_copy(snapshot->value, sampler->value);
+        sampler->has_last = snapshot->has_last;
+        sampler->last = snapshot->last;
+        return LLAMA_RS_STATUS_OK;
+    } catch (...) {
+        return llama_rs_chat_current_exception(out_error);
+    }
+}
+
 extern "C" llama_rs_status llama_rs_common_sampler_accept(
     struct llama_rs_common_sampler * sampler,
     llama_token token,

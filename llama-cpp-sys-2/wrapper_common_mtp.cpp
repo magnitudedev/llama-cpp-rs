@@ -80,7 +80,7 @@ extern "C" llama_rs_status llama_rs_mtp_preflight(
 
         speculative_ptr speculative(
             llama_rs_mtp_speculative_init(
-                target_context.get(), mtp_context.get(), 3, 0, 0.0f, 1),
+                target_context.get(), mtp_context.get(), 3, 0, 0.0f, 1, false),
             llama_rs_mtp_speculative_free);
         if (!speculative) {
             set_result(*out_result, LLAMA_RS_MTP_PREFLIGHT_CONTEXT_UNSUPPORTED);

@@ -159,6 +159,16 @@ llama_rs_status llama_rs_common_sampler_init(
 
 void llama_rs_common_sampler_free(struct llama_rs_common_sampler * sampler);
 
+llama_rs_status llama_rs_common_sampler_clone(
+    const struct llama_rs_common_sampler * sampler,
+    struct llama_rs_common_sampler ** out_clone,
+    char ** out_error);
+
+llama_rs_status llama_rs_common_sampler_restore(
+    struct llama_rs_common_sampler * sampler,
+    const struct llama_rs_common_sampler * snapshot,
+    char ** out_error);
+
 llama_rs_status llama_rs_common_sampler_accept(
     struct llama_rs_common_sampler * sampler,
     llama_token token,

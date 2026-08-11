@@ -318,6 +318,12 @@ pub struct CommonSampler<'model> {
     model: &'model LlamaModel,
 }
 
+/// Owned snapshot of every stateful component in a [`CommonSampler`].
+#[derive(Debug)]
+pub struct CommonSamplerSnapshot {
+    raw: NonNull<sys::llama_rs_common_sampler>,
+}
+
 impl<'model> CommonSampler<'model> {
     /// Construct the same high-level sampler chain used by llama.cpp tools.
     ///
@@ -479,6 +485,34 @@ impl<'model> CommonSampler<'model> {
         Ok(output.into_iter().map(LlamaToken).collect())
     }
 
+    /// Snapshot sampling, grammar, reasoning-budget, penalty, and RNG state.
+    ///
+    /// This is used to make speculative verification transactional when the
+    /// target context must be restored from a checkpoint.
+    pub fn snapshot(&self) -> Result<CommonSamplerSnapshot, CommonSamplerError> {
+        let mut raw = ptr::null_mut();
+        let mut error = ptr::null_mut();
+        let status = unsafe {
+            sys::llama_rs_common_sampler_clone(self.raw.as_ptr(), &raw mut raw, &raw mut error)
+        };
+        check_status(status, error)?;
+        let raw = NonNull::new(raw).ok_or(CommonSamplerError::NullSampler)?;
+        Ok(CommonSamplerSnapshot { raw })
+    }
+
+    /// Restore a snapshot produced by [`Self::snapshot`].
+    pub fn restore(&mut self, snapshot: &CommonSamplerSnapshot) -> Result<(), CommonSamplerError> {
+        let mut error = ptr::null_mut();
+        let status = unsafe {
+            sys::llama_rs_common_sampler_restore(
+                self.raw.as_ptr(),
+                snapshot.raw.as_ptr(),
+                &raw mut error,
+            )
+        };
+        check_status(status, error)
+    }
+
     /// Reset upstream primitive-sampler and accepted-token history.
     ///
     /// The pinned llama.cpp `common_sampler_reset` does not fully rewind its
@@ -550,6 +584,12 @@ impl<'model> CommonSampler<'model> {
 }
 
 impl Drop for CommonSampler<'_> {
+    fn drop(&mut self) {
+        unsafe { sys::llama_rs_common_sampler_free(self.raw.as_ptr()) };
+    }
+}
+
+impl Drop for CommonSamplerSnapshot {
     fn drop(&mut self) {
         unsafe { sys::llama_rs_common_sampler_free(self.raw.as_ptr()) };
     }

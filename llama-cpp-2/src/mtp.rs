@@ -9,7 +9,7 @@ use crate::model::params::LlamaModelParams;
 
 pub use crate::speculative::{
     MtpOperations, MtpSpeculative as MtpSession, MtpSpeculativeError as MtpError,
-    MtpSpeculativeParams as MtpParams,
+    MtpSpeculativeParams as MtpParams, MtpVerificationResolution,
 };
 
 /// Native parameters used to validate an MTP execution without allocating model tensors.
