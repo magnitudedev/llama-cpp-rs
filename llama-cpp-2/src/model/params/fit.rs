@@ -11,7 +11,7 @@ use crate::model::params::LlamaModelParams;
 use llama_cpp_sys_2 as sys;
 
 /// Stable identity of the native model-free ggml calibration procedure.
-pub const FIT_CALIBRATION_METHOD: &str = "llama-native-ggml-decode-calibration-v2";
+pub const FIT_CALIBRATION_METHOD: &str = "llama-native-ggml-decode-calibration-v3";
 
 /// Stable identity of the native decode-workload projection.
 pub const FIT_DECODE_WORKLOAD_METHOD: &str = "llama-native-decode-workload-v2";
@@ -1831,6 +1831,13 @@ mod tests {
         assert!(calibration.elapsed_microseconds <= 120_000_000);
         assert!(calibration.metrics.iter().any(|metric| !metric.routed));
         assert!(calibration.metrics.iter().any(|metric| metric.routed));
+        assert!(
+            calibration
+                .metrics
+                .iter()
+                .any(|metric| metric.tensor_type == sys::GGML_TYPE_NVFP4 as i32),
+            "at least one enabled backend must calibrate NVFP4"
+        );
         for metric in calibration.metrics {
             assert!(!metric.backend.is_empty());
             assert!(metric.bytes_per_second.is_finite() && metric.bytes_per_second > 0.0);

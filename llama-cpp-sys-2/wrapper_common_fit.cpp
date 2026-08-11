@@ -44,7 +44,7 @@ extern "C" int32_t llama_rs_common_default_math_threads(void) {
 }
 
 static constexpr const char * LLAMA_RS_FIT_CALIBRATION_METHOD =
-    "llama-native-ggml-decode-calibration-v2";
+    "llama-native-ggml-decode-calibration-v3";
 static constexpr const char * LLAMA_RS_FIT_DECODE_WORKLOAD_METHOD =
     "llama-native-decode-workload-v2";
 
@@ -571,6 +571,7 @@ extern "C" llama_rs_status llama_rs_fit_calibration_create(
             GGML_TYPE_Q8_0,
             GGML_TYPE_IQ4_NL,
             GGML_TYPE_MXFP4,
+            GGML_TYPE_NVFP4,
         };
         for (size_t device_index = 0; device_index < ggml_backend_dev_count(); ++device_index) {
             const auto device = ggml_backend_dev_get(device_index);
