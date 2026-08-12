@@ -18,6 +18,8 @@ use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use crate::context::params::FlashAttentionPolicy;
 use crate::context::LlamaContext;
 use crate::model::LlamaModel;
+#[cfg(feature = "common")]
+use crate::speculative::SpeculativeOperations;
 use crate::token::LlamaToken;
 
 // Upstream `mtmd_get_memory_usage` temporarily replaces mtmd's process-global callback/userdata
@@ -1012,6 +1014,59 @@ impl MtmdInputChunks {
             Err(MtmdEvalError::EvalFailure(result))
         }
     }
+
+    /// Evaluate every multimodal subbatch on the target and its linked speculative context.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the batch size is invalid, the projector belongs to a different
+    /// model, the speculative method cannot consume media embeddings, or native evaluation fails.
+    #[cfg(feature = "common")]
+    pub fn eval_chunks_speculative(
+        &self,
+        mtmd_ctx: &mut MtmdContext<'_>,
+        speculative: &mut SpeculativeOperations<'_>,
+        n_past: i32,
+        seq_id: i32,
+        n_batch: i32,
+        logits_last: bool,
+    ) -> Result<i32, MtmdEvalError> {
+        if n_batch <= 0 {
+            return Err(MtmdEvalError::InvalidBatchSize(n_batch));
+        }
+        if !speculative.supports_multimodal() {
+            return Err(MtmdEvalError::UnsupportedSpeculativeMethod);
+        }
+        ensure_matching_model(
+            std::ptr::from_ref(mtmd_ctx.model),
+            speculative.target_model_ptr(),
+        )?;
+        let mut new_n_past = n_past;
+        let mut result = 0;
+        let mut error = ptr::null_mut();
+        let _native_guard = mtmd_native_read();
+        let status = unsafe {
+            llama_cpp_sys_2::llama_rs_mtmd_eval_chunks_speculative(
+                mtmd_ctx.context.as_ptr(),
+                speculative.target_context_ptr(),
+                speculative.native_ptr(),
+                self.chunks.as_ptr(),
+                n_past,
+                seq_id,
+                n_batch,
+                logits_last,
+                &raw mut new_n_past,
+                &raw mut result,
+                &raw mut error,
+            )
+        };
+        check_mtmd_native_status(status, error)?;
+        if result == 0 {
+            Ok(new_n_past)
+        } else {
+            Err(MtmdEvalError::EvalFailure(result))
+        }
+    }
 }
 
 fn ensure_matching_model(
@@ -1757,6 +1812,9 @@ pub enum MtmdEvalError {
     /// The projector and text context were initialized from different models.
     #[error("the MTMD projector and llama context belong to different text models")]
     MismatchedModel,
+    /// The selected native speculative method cannot consume multimodal embedding batches.
+    #[error("the selected speculative method does not support multimodal input")]
+    UnsupportedSpeculativeMethod,
     /// Native collection metadata named an index but returned no chunk pointer.
     #[error("MTMD input chunk collection returned no chunk at in-range index {index}")]
     MissingChunk {

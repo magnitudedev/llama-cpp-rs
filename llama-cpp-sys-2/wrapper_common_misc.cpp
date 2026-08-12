@@ -120,7 +120,7 @@ extern "C" llama_rs_status llama_rs_sampler_accept(struct llama_sampler * sample
 }
 
 
-struct llama_rs_mtp_speculative {
+struct llama_rs_speculative {
     struct sequence_state {
         std::vector<llama_token> prompt;
         std::vector<llama_token> draft;
@@ -136,10 +136,12 @@ struct llama_rs_mtp_speculative {
     std::vector<sequence_state> sequences;
 };
 
-static bool llama_rs_mtp_batch_compatible(
+static bool llama_rs_speculative_batch_compatible(
     const struct llama_batch & batch,
     size_t n_seq) {
-    if (batch.n_tokens <= 0 || !batch.token || batch.embd || !batch.pos || !batch.n_seq_id ||
+    const bool has_tokens = batch.token != nullptr;
+    const bool has_embeddings = batch.embd != nullptr;
+    if (batch.n_tokens <= 0 || has_tokens == has_embeddings || !batch.pos || !batch.n_seq_id ||
         !batch.seq_id) {
         return false;
     }
@@ -164,8 +166,8 @@ static void llama_rs_assign_tokens(
     dst.assign(tokens, tokens + count);
 }
 
-static llama_rs_status llama_rs_mtp_remove_memories(
-    struct llama_rs_mtp_speculative * spec,
+static llama_rs_status llama_rs_speculative_remove_memories(
+    struct llama_rs_speculative * spec,
     llama_seq_id seq_id,
     llama_pos p0,
     llama_pos p1,
@@ -175,20 +177,21 @@ static llama_rs_status llama_rs_mtp_remove_memories(
     const bool draft = llama_memory_seq_rm(
         llama_get_memory(spec->params.draft.ctx_dft), seq_id, p0, p1);
     if (!target && !draft) {
-        return llama_rs_chat_set_error(out_error, LLAMA_RS_STATUS_EXCEPTION, "target and draft memories rejected the MTP sequence range");
+        return llama_rs_chat_set_error(out_error, LLAMA_RS_STATUS_EXCEPTION, "target and draft memories rejected the speculative sequence range");
     }
     if (!target) {
-        return llama_rs_chat_set_error(out_error, LLAMA_RS_STATUS_EXCEPTION, "target memory rejected the MTP sequence range");
+        return llama_rs_chat_set_error(out_error, LLAMA_RS_STATUS_EXCEPTION, "target memory rejected the speculative sequence range");
     }
     if (!draft) {
-        return llama_rs_chat_set_error(out_error, LLAMA_RS_STATUS_EXCEPTION, "draft memory rejected the MTP sequence range");
+        return llama_rs_chat_set_error(out_error, LLAMA_RS_STATUS_EXCEPTION, "draft memory rejected the speculative sequence range");
     }
     return LLAMA_RS_STATUS_OK;
 }
 
-extern "C" struct llama_rs_mtp_speculative * llama_rs_mtp_speculative_init(
+extern "C" struct llama_rs_speculative * llama_rs_speculative_init(
     struct llama_context * ctx_tgt,
     struct llama_context * ctx_dft,
+    enum llama_rs_speculative_method method,
     int32_t n_max,
     int32_t n_min,
     float p_min,
@@ -199,8 +202,20 @@ extern "C" struct llama_rs_mtp_speculative * llama_rs_mtp_speculative_init(
     }
 
     try {
-        auto wrapper = std::make_unique<llama_rs_mtp_speculative>();
-        wrapper->params.types = { COMMON_SPECULATIVE_TYPE_DRAFT_MTP };
+        auto wrapper = std::make_unique<llama_rs_speculative>();
+        switch (method) {
+            case LLAMA_RS_SPECULATIVE_METHOD_MTP:
+                wrapper->params.types = { COMMON_SPECULATIVE_TYPE_DRAFT_MTP };
+                break;
+            case LLAMA_RS_SPECULATIVE_METHOD_DFLASH:
+                wrapper->params.types = { COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH };
+                break;
+            case LLAMA_RS_SPECULATIVE_METHOD_DSPARK:
+                wrapper->params.types = { COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK };
+                break;
+            default:
+                return nullptr;
+        }
         wrapper->params.draft.ctx_tgt = ctx_tgt;
         wrapper->params.draft.ctx_dft = ctx_dft;
         wrapper->params.draft.n_max = n_max;
@@ -234,7 +249,7 @@ extern "C" struct llama_rs_mtp_speculative * llama_rs_mtp_speculative_init(
     }
 }
 
-extern "C" void llama_rs_mtp_speculative_free(struct llama_rs_mtp_speculative * spec) {
+extern "C" void llama_rs_speculative_free(struct llama_rs_speculative * spec) {
     if (!spec) {
         return;
     }
@@ -245,8 +260,8 @@ extern "C" void llama_rs_mtp_speculative_free(struct llama_rs_mtp_speculative * 
     delete spec;
 }
 
-extern "C" llama_rs_status llama_rs_mtp_speculative_begin(
-    struct llama_rs_mtp_speculative * spec,
+extern "C" llama_rs_status llama_rs_speculative_begin(
+    struct llama_rs_speculative * spec,
     llama_seq_id seq_id,
     const llama_token * prompt_tokens,
     size_t prompt_tokens_count,
@@ -257,7 +272,7 @@ extern "C" llama_rs_status llama_rs_mtp_speculative_begin(
     if (!spec || !spec->spec || seq_id < 0 ||
         static_cast<size_t>(seq_id) >= spec->sequences.size() ||
         (!prompt_tokens && prompt_tokens_count > 0)) {
-        return llama_rs_chat_set_error(out_error, LLAMA_RS_STATUS_INVALID_ARGUMENT, "invalid MTP begin arguments");
+        return llama_rs_chat_set_error(out_error, LLAMA_RS_STATUS_INVALID_ARGUMENT, "invalid speculative begin arguments");
     }
 
     try {
@@ -274,18 +289,18 @@ extern "C" llama_rs_status llama_rs_mtp_speculative_begin(
     }
 }
 
-extern "C" llama_rs_status llama_rs_mtp_speculative_process(
-    struct llama_rs_mtp_speculative * spec,
+extern "C" llama_rs_status llama_rs_speculative_process(
+    struct llama_rs_speculative * spec,
     const struct llama_batch * batch,
     char ** out_error) {
     if (out_error) {
         *out_error = nullptr;
     }
     if (!spec || !spec->spec || !batch) {
-        return llama_rs_chat_set_error(out_error, LLAMA_RS_STATUS_INVALID_ARGUMENT, "invalid MTP process arguments");
+        return llama_rs_chat_set_error(out_error, LLAMA_RS_STATUS_INVALID_ARGUMENT, "invalid speculative process arguments");
     }
-    if (!llama_rs_mtp_batch_compatible(*batch, spec->sequences.size())) {
-        return llama_rs_chat_set_error(out_error, LLAMA_RS_STATUS_INVALID_ARGUMENT, "MTP process batch is incompatible with the configured sequences");
+    if (!llama_rs_speculative_batch_compatible(*batch, spec->sequences.size())) {
+        return llama_rs_chat_set_error(out_error, LLAMA_RS_STATUS_INVALID_ARGUMENT, "speculative process batch is incompatible with the configured sequences");
     }
 
     try {
@@ -298,8 +313,8 @@ extern "C" llama_rs_status llama_rs_mtp_speculative_process(
     }
 }
 
-extern "C" llama_rs_status llama_rs_mtp_speculative_prepare_draft(
-    struct llama_rs_mtp_speculative * spec,
+extern "C" llama_rs_status llama_rs_speculative_prepare_draft(
+    struct llama_rs_speculative * spec,
     llama_seq_id seq_id,
     llama_pos n_past,
     llama_token id_last,
@@ -313,13 +328,13 @@ extern "C" llama_rs_status llama_rs_mtp_speculative_prepare_draft(
     if (!spec || !spec->spec || (!prompt_tokens && prompt_tokens_count > 0) ||
         seq_id < 0 || static_cast<size_t>(seq_id) >= spec->sequences.size() ||
         n_past < 0 || n_max <= 0 || n_max > spec->params.draft.n_max) {
-        return llama_rs_chat_set_error(out_error, LLAMA_RS_STATUS_INVALID_ARGUMENT, "invalid MTP prepare-draft arguments");
+        return llama_rs_chat_set_error(out_error, LLAMA_RS_STATUS_INVALID_ARGUMENT, "invalid speculative prepare-draft arguments");
     }
 
     try {
         auto & sequence = spec->sequences[seq_id];
         if (sequence.draft_pending || sequence.prepared) {
-            return llama_rs_chat_set_error(out_error, LLAMA_RS_STATUS_INVALID_STATE, "MTP sequence already has a pending or prepared draft");
+            return llama_rs_chat_set_error(out_error, LLAMA_RS_STATUS_INVALID_STATE, "speculative sequence already has a pending or prepared draft");
         }
         llama_rs_assign_tokens(sequence.prompt, prompt_tokens, prompt_tokens_count);
         sequence.draft.clear();
@@ -352,14 +367,14 @@ extern "C" llama_rs_status llama_rs_mtp_speculative_prepare_draft(
     }
 }
 
-extern "C" llama_rs_status llama_rs_mtp_speculative_draft(
-    struct llama_rs_mtp_speculative * spec,
+extern "C" llama_rs_status llama_rs_speculative_draft(
+    struct llama_rs_speculative * spec,
     char ** out_error) {
     if (out_error) {
         *out_error = nullptr;
     }
     if (!spec || !spec->spec) {
-        return llama_rs_chat_set_error(out_error, LLAMA_RS_STATUS_INVALID_ARGUMENT, "invalid MTP draft arguments");
+        return llama_rs_chat_set_error(out_error, LLAMA_RS_STATUS_INVALID_ARGUMENT, "invalid speculative draft arguments");
     }
     try {
         common_speculative_draft(spec->spec);
@@ -384,7 +399,7 @@ extern "C" llama_rs_status llama_rs_mtp_speculative_draft(
                     return llama_rs_chat_set_error(
                         out_error,
                         LLAMA_RS_STATUS_EXCEPTION,
-                        "draft memory rejected cleanup after MTP drafting");
+                        "draft memory rejected cleanup after speculative drafting");
                 }
 
                 if (sequence.draft_pending) {
@@ -418,8 +433,8 @@ extern "C" llama_rs_status llama_rs_mtp_speculative_draft(
     }
 }
 
-extern "C" llama_rs_status llama_rs_mtp_speculative_get_draft(
-    struct llama_rs_mtp_speculative * spec,
+extern "C" llama_rs_status llama_rs_speculative_get_draft(
+    struct llama_rs_speculative * spec,
     llama_seq_id seq_id,
     llama_token * out_tokens,
     size_t out_tokens_capacity,
@@ -430,16 +445,16 @@ extern "C" llama_rs_status llama_rs_mtp_speculative_get_draft(
     }
     if (!spec || !spec->spec || !out_tokens_count || seq_id < 0 ||
         static_cast<size_t>(seq_id) >= spec->sequences.size()) {
-        return llama_rs_chat_set_error(out_error, LLAMA_RS_STATUS_INVALID_ARGUMENT, "invalid MTP get-draft arguments");
+        return llama_rs_chat_set_error(out_error, LLAMA_RS_STATUS_INVALID_ARGUMENT, "invalid speculative get-draft arguments");
     }
     try {
         auto & sequence = spec->sequences[seq_id];
         *out_tokens_count = sequence.draft.size();
         if (sequence.draft.size() > out_tokens_capacity) {
-            return llama_rs_chat_set_error(out_error, LLAMA_RS_STATUS_ALLOCATION_FAILED, "MTP draft exceeds the output capacity");
+            return llama_rs_chat_set_error(out_error, LLAMA_RS_STATUS_ALLOCATION_FAILED, "speculative draft exceeds the output capacity");
         }
         if (!sequence.draft.empty() && !out_tokens) {
-            return llama_rs_chat_set_error(out_error, LLAMA_RS_STATUS_INVALID_ARGUMENT, "MTP draft output is null");
+            return llama_rs_chat_set_error(out_error, LLAMA_RS_STATUS_INVALID_ARGUMENT, "speculative draft output is null");
         }
         if (!sequence.draft.empty()) {
             std::memcpy(out_tokens, sequence.draft.data(), sequence.draft.size() * sizeof(llama_token));
@@ -450,8 +465,8 @@ extern "C" llama_rs_status llama_rs_mtp_speculative_get_draft(
     }
 }
 
-extern "C" llama_rs_status llama_rs_mtp_speculative_resolve(
-    struct llama_rs_mtp_speculative * spec,
+extern "C" llama_rs_status llama_rs_speculative_resolve(
+    struct llama_rs_speculative * spec,
     llama_seq_id seq_id,
     size_t proposed_count,
     uint16_t accepted_count,
@@ -463,13 +478,13 @@ extern "C" llama_rs_status llama_rs_mtp_speculative_resolve(
     }
     if (!spec || !spec->spec || !out_replay || next_position < 0 || seq_id < 0 ||
         static_cast<size_t>(seq_id) >= spec->sequences.size()) {
-        return llama_rs_chat_set_error(out_error, LLAMA_RS_STATUS_INVALID_ARGUMENT, "invalid MTP resolve arguments");
+        return llama_rs_chat_set_error(out_error, LLAMA_RS_STATUS_INVALID_ARGUMENT, "invalid speculative resolve arguments");
     }
     *out_replay = false;
     auto & sequence = spec->sequences[seq_id];
     if (!sequence.draft_pending || proposed_count == 0 ||
         proposed_count > sequence.last_draft_len || accepted_count > proposed_count) {
-        return llama_rs_chat_set_error(out_error, LLAMA_RS_STATUS_INVALID_STATE, "MTP resolution does not match the pending draft");
+        return llama_rs_chat_set_error(out_error, LLAMA_RS_STATUS_INVALID_STATE, "speculative resolution does not match the pending draft");
     }
 
     try {
@@ -484,7 +499,7 @@ extern "C" llama_rs_status llama_rs_mtp_speculative_resolve(
                 return llama_rs_chat_set_error(
                     out_error,
                     LLAMA_RS_STATUS_INVALID_STATE,
-                    "MTP target rollback requires a missing checkpoint");
+                    "speculative target rollback requires a missing checkpoint");
             }
             sequence.checkpoint.load_tgt(
                 spec->params.draft.ctx_tgt,
@@ -494,7 +509,7 @@ extern "C" llama_rs_status llama_rs_mtp_speculative_resolve(
                 spec->params.draft.ctx_dft,
                 seq_id,
                 LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-            const auto status = llama_rs_mtp_remove_memories(
+            const auto status = llama_rs_speculative_remove_memories(
                 spec, seq_id, sequence.checkpoint.pos_max + 1, -1, out_error);
             if (status != LLAMA_RS_STATUS_OK) {
                 return status;
@@ -504,7 +519,7 @@ extern "C" llama_rs_status llama_rs_mtp_speculative_resolve(
         }
 
         common_speculative_accept(spec->spec, seq_id, accepted_count);
-        const auto status = llama_rs_mtp_remove_memories(
+        const auto status = llama_rs_speculative_remove_memories(
             spec, seq_id, next_position, -1, out_error);
         if (status != LLAMA_RS_STATUS_OK) {
             return status;
@@ -519,8 +534,8 @@ extern "C" llama_rs_status llama_rs_mtp_speculative_resolve(
     }
 }
 
-extern "C" llama_rs_status llama_rs_mtp_speculative_seq_rm(
-    struct llama_rs_mtp_speculative * spec,
+extern "C" llama_rs_status llama_rs_speculative_seq_rm(
+    struct llama_rs_speculative * spec,
     llama_seq_id seq_id,
     llama_pos p0,
     llama_pos p1,
@@ -531,10 +546,10 @@ extern "C" llama_rs_status llama_rs_mtp_speculative_seq_rm(
     if (!spec || !spec->spec || seq_id < 0 ||
         static_cast<size_t>(seq_id) >= spec->sequences.size() ||
         !spec->params.draft.ctx_tgt || !spec->params.draft.ctx_dft) {
-        return llama_rs_chat_set_error(out_error, LLAMA_RS_STATUS_INVALID_ARGUMENT, "invalid MTP sequence-remove arguments");
+        return llama_rs_chat_set_error(out_error, LLAMA_RS_STATUS_INVALID_ARGUMENT, "invalid speculative sequence-remove arguments");
     }
     try {
-        return llama_rs_mtp_remove_memories(spec, seq_id, p0, p1, out_error);
+        return llama_rs_speculative_remove_memories(spec, seq_id, p0, p1, out_error);
     } catch (...) {
         return llama_rs_chat_current_exception(out_error);
     }

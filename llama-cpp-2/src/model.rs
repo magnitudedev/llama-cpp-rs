@@ -883,17 +883,23 @@ impl LlamaModel {
         Ok(LlamaContext::new(self, context, params.embeddings()))
     }
 
-    /// Create an MTP context linked to an existing target context.
+    /// Create a speculative draft context linked to an existing target context.
     ///
     /// The returned context cannot outlive either the model or target context.
+    #[cfg(feature = "common")]
     #[allow(clippy::needless_pass_by_value)]
-    pub(crate) fn new_mtp_context_linked<'a>(
+    pub(crate) fn new_speculative_context_linked<'a>(
         &'a self,
         _: &LlamaBackend,
         mut params: LlamaContextParams,
         target: &LlamaContext<'_>,
+        method: crate::speculative::SpeculativeMethod,
     ) -> Result<LlamaContext<'a>, LlamaContextLoadError> {
-        params.context_params.ctx_type = llama_cpp_sys_2::LLAMA_CONTEXT_TYPE_MTP;
+        params.context_params.ctx_type = if method.uses_mtp_context() {
+            llama_cpp_sys_2::LLAMA_CONTEXT_TYPE_MTP
+        } else {
+            llama_cpp_sys_2::LLAMA_CONTEXT_TYPE_DEFAULT
+        };
         params.context_params.ctx_other = target.context.as_ptr();
         let context_params = params.context_params;
         let context = unsafe {

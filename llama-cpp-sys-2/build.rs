@@ -579,8 +579,8 @@ fn main() {
         "wrapper_common_fit.cpp",
         "wrapper_common_misc.h",
         "wrapper_common_misc.cpp",
-        "wrapper_common_mtp.h",
-        "wrapper_common_mtp.cpp",
+        "wrapper_common_speculative.h",
+        "wrapper_common_speculative.cpp",
     ] {
         println!("cargo:rerun-if-changed={common_wrapper}");
     }
@@ -589,6 +589,8 @@ fn main() {
     println!("cargo:rerun-if-changed=wrapper_mtmd.h");
     println!("cargo:rerun-if-changed=wrapper_mtmd_ext.h");
     println!("cargo:rerun-if-changed=wrapper_mtmd_ext.cpp");
+    println!("cargo:rerun-if-changed=wrapper_mtmd_speculative.h");
+    println!("cargo:rerun-if-changed=wrapper_mtmd_speculative.cpp");
 
     debug_log!("Bindings Created");
 
@@ -619,7 +621,7 @@ fn main() {
                 "wrapper_common_sampling.cpp",
                 "wrapper_common_fit.cpp",
                 "wrapper_common_misc.cpp",
-                "wrapper_common_mtp.cpp",
+                "wrapper_common_speculative.cpp",
             ])
             .include(&llama_src)
             .include(llama_src.join("common"))
@@ -1063,6 +1065,10 @@ fn main() {
             .flag_if_supported("-std=c++17")
             .flag_if_supported("-Wno-cast-qual")
             .pic(true);
+
+        if cfg!(feature = "common") {
+            mtmd_build.file("wrapper_mtmd_speculative.cpp");
+        }
 
         if matches!(target_os, TargetOs::Windows(WindowsVariant::Msvc)) {
             mtmd_build.flag("/std:c++17");

@@ -39,11 +39,11 @@ mod log;
 pub mod model;
 #[cfg(feature = "mtmd")]
 pub mod mtmd;
-#[cfg(feature = "common")]
-pub mod mtp;
 pub mod sampling;
 #[cfg(feature = "common")]
-mod speculative;
+pub mod speculative;
+#[cfg(feature = "common")]
+mod speculative_preflight;
 pub mod timing;
 pub mod token;
 pub mod token_type;

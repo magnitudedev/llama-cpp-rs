@@ -1,5 +1,4 @@
 #include "wrapper_mtmd_ext.h"
-
 #include "llama.cpp/ggml/include/ggml-backend.h"
 #include "llama.cpp/tools/mtmd/clip.h"
 #include "llama.cpp/tools/mtmd/mtmd-helper.h"
