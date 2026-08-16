@@ -102,6 +102,18 @@ llama_rs_status llama_rs_mtmd_eval_chunks(
     int32_t * out_result,
     char ** out_error);
 
+llama_rs_status llama_rs_mtmd_eval_chunk(
+    struct mtmd_context * context,
+    struct llama_context * llama_context,
+    const struct mtmd_input_chunk * chunk,
+    llama_pos n_past,
+    llama_seq_id seq_id,
+    int32_t n_batch,
+    bool logits_last,
+    llama_pos * out_new_n_past,
+    int32_t * out_result,
+    char ** out_error);
+
 // Unlike mtmd_get_cap_from_file, this adapter preserves clip_get_cap failures.
 llama_rs_status llama_rs_mtmd_capabilities_from_file(
     const char * path,

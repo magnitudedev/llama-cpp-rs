@@ -390,6 +390,45 @@ extern "C" llama_rs_status llama_rs_mtmd_eval_chunks(
     }
 }
 
+extern "C" llama_rs_status llama_rs_mtmd_eval_chunk(
+    struct mtmd_context * context,
+    struct llama_context * llama_context,
+    const struct mtmd_input_chunk * chunk,
+    llama_pos n_past,
+    llama_seq_id seq_id,
+    int32_t n_batch,
+    bool logits_last,
+    llama_pos * out_new_n_past,
+    int32_t * out_result,
+    char ** out_error) {
+    if (out_error) {
+        *out_error = nullptr;
+    }
+    if (!context || !llama_context || !chunk || !out_new_n_past || !out_result || n_batch <= 0) {
+        return llama_rs_chat_set_error(
+            out_error,
+            LLAMA_RS_STATUS_INVALID_ARGUMENT,
+            "multimodal chunk evaluation arguments are invalid");
+    }
+
+    try {
+        llama_pos new_n_past = n_past;
+        *out_result = mtmd_helper_eval_chunk_single(
+            context,
+            llama_context,
+            chunk,
+            n_past,
+            seq_id,
+            n_batch,
+            logits_last,
+            &new_n_past);
+        *out_new_n_past = new_n_past;
+        return LLAMA_RS_STATUS_OK;
+    } catch (...) {
+        return llama_rs_chat_current_exception(out_error);
+    }
+}
+
 extern "C" llama_rs_status llama_rs_mtmd_capabilities_from_file(
     const char * path,
     struct llama_rs_mtmd_capabilities * out_capabilities,

@@ -801,6 +801,21 @@ pub struct MtmdInputChunks {
     chunks: NonNull<llama_cpp_sys_2::mtmd_input_chunks>,
 }
 
+/// Coordinates one complete multimodal input-chunk evaluation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MtmdChunkEvalParams {
+    /// Index of the text or media chunk to evaluate.
+    pub index: usize,
+    /// Native sequence position at which the chunk begins.
+    pub n_past: i32,
+    /// Native sequence identifier that owns the decoded state.
+    pub seq_id: i32,
+    /// Maximum logical batch size passed to llama.cpp.
+    pub n_batch: i32,
+    /// Whether the final token in this chunk should produce logits.
+    pub logits_last: bool,
+}
+
 impl MtmdInputChunks {
     /// Create a new empty input chunks collection
     ///
@@ -1015,6 +1030,70 @@ impl MtmdInputChunks {
         }
     }
 
+    /// Evaluate one complete input chunk, beginning at `n_past`.
+    ///
+    /// This is the primitive required by semantic multimodal prompt caching: callers can retain
+    /// an exact prefix at chunk boundaries and evaluate only the first unmatched text or media
+    /// chunk. Media chunks remain indivisible because projector output cannot be reconstructed
+    /// from a partial logical token prefix.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid batch size, missing or unsupported chunk, mismatched model,
+    /// or native evaluation failure.
+    pub fn eval_chunk(
+        &self,
+        mtmd_ctx: &mut MtmdContext<'_>,
+        llama_ctx: &mut LlamaContext,
+        params: MtmdChunkEvalParams,
+    ) -> Result<i32, MtmdEvalError> {
+        let MtmdChunkEvalParams {
+            index,
+            n_past,
+            seq_id,
+            n_batch,
+            logits_last,
+        } = params;
+        if n_batch <= 0 {
+            return Err(MtmdEvalError::InvalidBatchSize(n_batch));
+        }
+        ensure_matching_model(
+            std::ptr::from_ref(mtmd_ctx.model),
+            std::ptr::from_ref(llama_ctx.model),
+        )?;
+        let chunk = self
+            .get(index)
+            .ok_or(MtmdEvalError::MissingChunk { index })?;
+        if let MtmdInputChunkType::Unknown(raw) = chunk.chunk_type() {
+            return Err(MtmdEvalError::UnsupportedType { raw });
+        }
+
+        let _native_guard = mtmd_native_read();
+        let mut new_n_past = n_past;
+        let mut result = 0;
+        let mut error = ptr::null_mut();
+        let status = unsafe {
+            llama_cpp_sys_2::llama_rs_mtmd_eval_chunk(
+                mtmd_ctx.context.as_ptr(),
+                llama_ctx.context.as_ptr(),
+                chunk.chunk.as_ptr(),
+                n_past,
+                seq_id,
+                n_batch,
+                logits_last,
+                &raw mut new_n_past,
+                &raw mut result,
+                &raw mut error,
+            )
+        };
+        check_mtmd_native_status(status, error)?;
+        if result == 0 {
+            Ok(new_n_past)
+        } else {
+            Err(MtmdEvalError::EvalFailure(result))
+        }
+    }
+
     /// Evaluate every multimodal subbatch on the target and its linked speculative context.
     ///
     /// # Errors
@@ -1051,6 +1130,70 @@ impl MtmdInputChunks {
                 speculative.target_context_ptr(),
                 speculative.native_ptr(),
                 self.chunks.as_ptr(),
+                n_past,
+                seq_id,
+                n_batch,
+                logits_last,
+                &raw mut new_n_past,
+                &raw mut result,
+                &raw mut error,
+            )
+        };
+        check_mtmd_native_status(status, error)?;
+        if result == 0 {
+            Ok(new_n_past)
+        } else {
+            Err(MtmdEvalError::EvalFailure(result))
+        }
+    }
+
+    /// Evaluate one complete input chunk on the target and linked speculative contexts.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid arguments, an unsupported speculative method, a mismatched
+    /// model, or native evaluation failure.
+    #[cfg(feature = "common")]
+    pub fn eval_chunk_speculative(
+        &self,
+        mtmd_ctx: &mut MtmdContext<'_>,
+        speculative: &mut SpeculativeOperations<'_>,
+        params: MtmdChunkEvalParams,
+    ) -> Result<i32, MtmdEvalError> {
+        let MtmdChunkEvalParams {
+            index,
+            n_past,
+            seq_id,
+            n_batch,
+            logits_last,
+        } = params;
+        if n_batch <= 0 {
+            return Err(MtmdEvalError::InvalidBatchSize(n_batch));
+        }
+        if !speculative.supports_multimodal() {
+            return Err(MtmdEvalError::UnsupportedSpeculativeMethod);
+        }
+        ensure_matching_model(
+            std::ptr::from_ref(mtmd_ctx.model),
+            speculative.target_model_ptr(),
+        )?;
+        let chunk = self
+            .get(index)
+            .ok_or(MtmdEvalError::MissingChunk { index })?;
+        if let MtmdInputChunkType::Unknown(raw) = chunk.chunk_type() {
+            return Err(MtmdEvalError::UnsupportedType { raw });
+        }
+
+        let _native_guard = mtmd_native_read();
+        let mut new_n_past = n_past;
+        let mut result = 0;
+        let mut error = ptr::null_mut();
+        let status = unsafe {
+            llama_cpp_sys_2::llama_rs_mtmd_eval_chunk_speculative(
+                mtmd_ctx.context.as_ptr(),
+                speculative.target_context_ptr(),
+                speculative.native_ptr(),
+                chunk.chunk.as_ptr(),
                 n_past,
                 seq_id,
                 n_batch,
@@ -1916,6 +2059,56 @@ mod tests {
             decoded,
             MtmdPreflightError::InvalidArgument { .. }
         ));
+    }
+
+    #[test]
+    fn single_chunk_evaluation_bridge_rejects_null_arguments() {
+        let _native_guard = mtmd_native_read();
+        let mut new_n_past = 0;
+        let mut result = 0;
+        let mut error = ptr::null_mut();
+        let status = unsafe {
+            llama_cpp_sys_2::llama_rs_mtmd_eval_chunk(
+                ptr::null_mut(),
+                ptr::null_mut(),
+                ptr::null(),
+                0,
+                0,
+                1,
+                false,
+                &raw mut new_n_past,
+                &raw mut result,
+                &raw mut error,
+            )
+        };
+        let decoded = check_mtmd_native_status(status, error).unwrap_err();
+        assert!(matches!(decoded, MtmdNativeError::InvalidArgument { .. }));
+    }
+
+    #[cfg(feature = "common")]
+    #[test]
+    fn speculative_single_chunk_bridge_rejects_null_arguments() {
+        let _native_guard = mtmd_native_read();
+        let mut new_n_past = 0;
+        let mut result = 0;
+        let mut error = ptr::null_mut();
+        let status = unsafe {
+            llama_cpp_sys_2::llama_rs_mtmd_eval_chunk_speculative(
+                ptr::null_mut(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+                ptr::null(),
+                0,
+                0,
+                1,
+                false,
+                &raw mut new_n_past,
+                &raw mut result,
+                &raw mut error,
+            )
+        };
+        let decoded = check_mtmd_native_status(status, error).unwrap_err();
+        assert!(matches!(decoded, MtmdNativeError::InvalidArgument { .. }));
     }
 
     #[test]
