@@ -124,7 +124,10 @@ struct llama_rs_speculative {
     struct sequence_state {
         std::vector<llama_token> prompt;
         std::vector<llama_token> draft;
-        common_prompt_checkpoint checkpoint;
+        common_prompt_checkpoint target_checkpoint;
+        common_prompt_checkpoint draft_checkpoint;
+        bool target_checkpointed = false;
+        bool draft_checkpointed = false;
         size_t last_draft_len = 0;
         bool draft_pending = false;
         bool prepared = false;
@@ -169,13 +172,15 @@ static void llama_rs_assign_tokens(
 static llama_rs_status llama_rs_speculative_remove_memories(
     struct llama_rs_speculative * spec,
     llama_seq_id seq_id,
-    llama_pos p0,
-    llama_pos p1,
+    llama_pos target_p0,
+    llama_pos target_p1,
+    llama_pos draft_p0,
+    llama_pos draft_p1,
     char ** out_error) {
     const bool target = llama_memory_seq_rm(
-        llama_get_memory(spec->params.draft.ctx_tgt), seq_id, p0, p1);
+        llama_get_memory(spec->params.draft.ctx_tgt), seq_id, target_p0, target_p1);
     const bool draft = llama_memory_seq_rm(
-        llama_get_memory(spec->params.draft.ctx_dft), seq_id, p0, p1);
+        llama_get_memory(spec->params.draft.ctx_dft), seq_id, draft_p0, draft_p1);
     if (!target && !draft) {
         return llama_rs_chat_set_error(out_error, LLAMA_RS_STATUS_EXCEPTION, "target and draft memories rejected the speculative sequence range");
     }
@@ -281,7 +286,10 @@ extern "C" llama_rs_status llama_rs_speculative_begin(
         sequence.last_draft_len = 0;
         sequence.draft_pending = false;
         sequence.prepared = false;
-        sequence.checkpoint.clear();
+        sequence.target_checkpoint.clear();
+        sequence.draft_checkpoint.clear();
+        sequence.target_checkpointed = false;
+        sequence.draft_checkpointed = false;
         common_speculative_begin(spec->spec, seq_id, sequence.prompt);
         return LLAMA_RS_STATUS_OK;
     } catch (...) {
@@ -292,11 +300,14 @@ extern "C" llama_rs_status llama_rs_speculative_begin(
 extern "C" llama_rs_status llama_rs_speculative_process(
     struct llama_rs_speculative * spec,
     const struct llama_batch * batch,
+    const llama_pos * draft_positions,
+    size_t draft_positions_count,
     char ** out_error) {
     if (out_error) {
         *out_error = nullptr;
     }
-    if (!spec || !spec->spec || !batch) {
+    if (!spec || !spec->spec || !batch || !draft_positions ||
+        draft_positions_count != static_cast<size_t>(batch->n_tokens)) {
         return llama_rs_chat_set_error(out_error, LLAMA_RS_STATUS_INVALID_ARGUMENT, "invalid speculative process arguments");
     }
     if (!llama_rs_speculative_batch_compatible(*batch, spec->sequences.size())) {
@@ -304,7 +315,9 @@ extern "C" llama_rs_status llama_rs_speculative_process(
     }
 
     try {
-        if (!common_speculative_process(spec->spec, *batch)) {
+        llama_batch draft_batch = *batch;
+        draft_batch.pos = const_cast<llama_pos *>(draft_positions);
+        if (!common_speculative_process(spec->spec, draft_batch)) {
             return llama_rs_chat_set_error(out_error, LLAMA_RS_STATUS_EXCEPTION, "common_speculative_process returned false");
         }
         return LLAMA_RS_STATUS_OK;
@@ -316,7 +329,8 @@ extern "C" llama_rs_status llama_rs_speculative_process(
 extern "C" llama_rs_status llama_rs_speculative_prepare_draft(
     struct llama_rs_speculative * spec,
     llama_seq_id seq_id,
-    llama_pos n_past,
+    llama_pos target_n_past,
+    llama_pos draft_n_past,
     llama_token id_last,
     const llama_token * prompt_tokens,
     size_t prompt_tokens_count,
@@ -327,7 +341,7 @@ extern "C" llama_rs_status llama_rs_speculative_prepare_draft(
     }
     if (!spec || !spec->spec || (!prompt_tokens && prompt_tokens_count > 0) ||
         seq_id < 0 || static_cast<size_t>(seq_id) >= spec->sequences.size() ||
-        n_past < 0 || n_max <= 0 || n_max > spec->params.draft.n_max) {
+        target_n_past < 0 || draft_n_past < 0 || n_max <= 0 || n_max > spec->params.draft.n_max) {
         return llama_rs_chat_set_error(out_error, LLAMA_RS_STATUS_INVALID_ARGUMENT, "invalid speculative prepare-draft arguments");
     }
 
@@ -339,23 +353,31 @@ extern "C" llama_rs_status llama_rs_speculative_prepare_draft(
         llama_rs_assign_tokens(sequence.prompt, prompt_tokens, prompt_tokens_count);
         sequence.draft.clear();
         sequence.last_draft_len = 0;
-        sequence.checkpoint.clear();
-        sequence.checkpoint.update_pos(
-            n_past,
+        sequence.target_checkpoint.clear();
+        sequence.draft_checkpoint.clear();
+        sequence.target_checkpointed = false;
+        sequence.draft_checkpointed = false;
+        sequence.target_checkpoint.update_pos(
+            target_n_past,
             llama_memory_seq_pos_min(llama_get_memory(spec->params.draft.ctx_tgt), seq_id),
             llama_memory_seq_pos_max(llama_get_memory(spec->params.draft.ctx_tgt), seq_id));
+        sequence.draft_checkpoint.update_pos(
+            draft_n_past,
+            llama_memory_seq_pos_min(llama_get_memory(spec->params.draft.ctx_dft), seq_id),
+            llama_memory_seq_pos_max(llama_get_memory(spec->params.draft.ctx_dft), seq_id));
         if (spec->draft_remove_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL) {
-            sequence.checkpoint.update_dft(
+            sequence.draft_checkpoint.update_dft(
                 spec->params.draft.ctx_dft,
                 seq_id,
                 LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+            sequence.draft_checkpointed = true;
         }
 
         auto & params = common_speculative_get_draft_params(spec->spec, seq_id);
         params = {
             true,
             n_max,
-            n_past,
+            draft_n_past,
             id_last,
             &sequence.prompt,
             &sequence.draft,
@@ -386,7 +408,7 @@ extern "C" llama_rs_status llama_rs_speculative_draft(
                 sequence.prepared = false;
 
                 if (spec->draft_remove_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL) {
-                    sequence.checkpoint.load_dft(
+                    sequence.draft_checkpoint.load_dft(
                         spec->params.draft.ctx_dft,
                         static_cast<llama_seq_id>(seq_id),
                         LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
@@ -394,7 +416,7 @@ extern "C" llama_rs_status llama_rs_speculative_draft(
                 if (!llama_memory_seq_rm(
                         llama_get_memory(spec->params.draft.ctx_dft),
                         static_cast<llama_seq_id>(seq_id),
-                        sequence.checkpoint.pos_max + 1,
+                        sequence.draft_checkpoint.pos_max + 1,
                         -1)) {
                     return llama_rs_chat_set_error(
                         out_error,
@@ -411,19 +433,24 @@ extern "C" llama_rs_status llama_rs_speculative_draft(
                         spec->draft_remove_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS &&
                         sequence.draft.size() > llama_n_rs_seq(spec->params.draft.ctx_dft);
                     if (checkpoint_target) {
-                        sequence.checkpoint.update_tgt(
+                        sequence.target_checkpoint.update_tgt(
                             spec->params.draft.ctx_tgt,
                             static_cast<llama_seq_id>(seq_id),
                             LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                        sequence.target_checkpointed = true;
                     }
                     if (checkpoint_draft) {
-                        sequence.checkpoint.update_dft(
+                        sequence.draft_checkpoint.update_dft(
                             spec->params.draft.ctx_dft,
                             static_cast<llama_seq_id>(seq_id),
                             LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                        sequence.draft_checkpointed = true;
                     }
                 } else {
-                    sequence.checkpoint.clear();
+                    sequence.target_checkpoint.clear();
+                    sequence.draft_checkpoint.clear();
+                    sequence.target_checkpointed = false;
+                    sequence.draft_checkpointed = false;
                 }
             }
         }
@@ -470,13 +497,15 @@ extern "C" llama_rs_status llama_rs_speculative_resolve(
     llama_seq_id seq_id,
     size_t proposed_count,
     uint16_t accepted_count,
-    llama_pos next_position,
+    llama_pos next_target_position,
+    llama_pos next_draft_position,
     bool * out_replay,
     char ** out_error) {
     if (out_error) {
         *out_error = nullptr;
     }
-    if (!spec || !spec->spec || !out_replay || next_position < 0 || seq_id < 0 ||
+    if (!spec || !spec->spec || !out_replay || next_target_position < 0 ||
+        next_draft_position < 0 || seq_id < 0 ||
         static_cast<size_t>(seq_id) >= spec->sequences.size()) {
         return llama_rs_chat_set_error(out_error, LLAMA_RS_STATUS_INVALID_ARGUMENT, "invalid speculative resolve arguments");
     }
@@ -495,22 +524,30 @@ extern "C" llama_rs_status llama_rs_speculative_resolve(
              rollback > llama_n_rs_seq(spec->params.draft.ctx_tgt));
 
         if (rollback > 0 && restore_target) {
-            if (sequence.checkpoint.empty()) {
+            if (!sequence.target_checkpointed) {
                 return llama_rs_chat_set_error(
                     out_error,
                     LLAMA_RS_STATUS_INVALID_STATE,
                     "speculative target rollback requires a missing checkpoint");
             }
-            sequence.checkpoint.load_tgt(
+            sequence.target_checkpoint.load_tgt(
                 spec->params.draft.ctx_tgt,
                 seq_id,
                 LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-            sequence.checkpoint.load_dft(
-                spec->params.draft.ctx_dft,
-                seq_id,
-                LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+            if (sequence.draft_checkpointed) {
+                sequence.draft_checkpoint.load_dft(
+                    spec->params.draft.ctx_dft,
+                    seq_id,
+                    LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+            }
             const auto status = llama_rs_speculative_remove_memories(
-                spec, seq_id, sequence.checkpoint.pos_max + 1, -1, out_error);
+                spec,
+                seq_id,
+                sequence.target_checkpoint.pos_max + 1,
+                -1,
+                sequence.draft_checkpoint.pos_max + 1,
+                -1,
+                out_error);
             if (status != LLAMA_RS_STATUS_OK) {
                 return status;
             }
@@ -520,14 +557,17 @@ extern "C" llama_rs_status llama_rs_speculative_resolve(
 
         common_speculative_accept(spec->spec, seq_id, accepted_count);
         const auto status = llama_rs_speculative_remove_memories(
-            spec, seq_id, next_position, -1, out_error);
+            spec, seq_id, next_target_position, -1, next_draft_position, -1, out_error);
         if (status != LLAMA_RS_STATUS_OK) {
             return status;
         }
         sequence.last_draft_len = 0;
         sequence.draft_pending = false;
         sequence.draft.clear();
-        sequence.checkpoint.clear();
+        sequence.target_checkpoint.clear();
+        sequence.draft_checkpoint.clear();
+        sequence.target_checkpointed = false;
+        sequence.draft_checkpointed = false;
         return LLAMA_RS_STATUS_OK;
     } catch (...) {
         return llama_rs_chat_current_exception(out_error);
@@ -537,8 +577,10 @@ extern "C" llama_rs_status llama_rs_speculative_resolve(
 extern "C" llama_rs_status llama_rs_speculative_seq_rm(
     struct llama_rs_speculative * spec,
     llama_seq_id seq_id,
-    llama_pos p0,
-    llama_pos p1,
+    llama_pos target_p0,
+    llama_pos target_p1,
+    llama_pos draft_p0,
+    llama_pos draft_p1,
     char ** out_error) {
     if (out_error) {
         *out_error = nullptr;
@@ -549,7 +591,126 @@ extern "C" llama_rs_status llama_rs_speculative_seq_rm(
         return llama_rs_chat_set_error(out_error, LLAMA_RS_STATUS_INVALID_ARGUMENT, "invalid speculative sequence-remove arguments");
     }
     try {
-        return llama_rs_speculative_remove_memories(spec, seq_id, p0, p1, out_error);
+        return llama_rs_speculative_remove_memories(
+            spec, seq_id, target_p0, target_p1, draft_p0, draft_p1, out_error);
+    } catch (...) {
+        return llama_rs_chat_current_exception(out_error);
+    }
+}
+
+extern "C" llama_rs_status llama_rs_speculative_state_size(
+    struct llama_rs_speculative * spec,
+    llama_seq_id seq_id,
+    size_t * out_size,
+    bool * out_has_state,
+    char ** out_error) {
+    if (out_error) {
+        *out_error = nullptr;
+    }
+    if (!spec || !spec->spec || !out_size || !out_has_state || seq_id < 0 ||
+        static_cast<size_t>(seq_id) >= spec->sequences.size()) {
+        return llama_rs_chat_set_error(
+            out_error,
+            LLAMA_RS_STATUS_INVALID_ARGUMENT,
+            "invalid speculative state-size arguments");
+    }
+    if (spec->sequences[seq_id].draft_pending || spec->sequences[seq_id].prepared) {
+        return llama_rs_chat_set_error(
+            out_error,
+            LLAMA_RS_STATUS_INVALID_STATE,
+            "speculative state can only be captured at a stable prompt boundary");
+    }
+    try {
+        std::vector<uint8_t> data;
+        *out_has_state = common_speculative_get_state(spec->spec, seq_id, data);
+        *out_size = data.size();
+        return LLAMA_RS_STATUS_OK;
+    } catch (...) {
+        return llama_rs_chat_current_exception(out_error);
+    }
+}
+
+extern "C" llama_rs_status llama_rs_speculative_state_get(
+    struct llama_rs_speculative * spec,
+    llama_seq_id seq_id,
+    uint8_t * out_data,
+    size_t out_capacity,
+    size_t * out_size,
+    bool * out_has_state,
+    char ** out_error) {
+    if (out_error) {
+        *out_error = nullptr;
+    }
+    if (!spec || !spec->spec || !out_size || !out_has_state || seq_id < 0 ||
+        static_cast<size_t>(seq_id) >= spec->sequences.size()) {
+        return llama_rs_chat_set_error(
+            out_error,
+            LLAMA_RS_STATUS_INVALID_ARGUMENT,
+            "invalid speculative state-get arguments");
+    }
+    if (spec->sequences[seq_id].draft_pending || spec->sequences[seq_id].prepared) {
+        return llama_rs_chat_set_error(
+            out_error,
+            LLAMA_RS_STATUS_INVALID_STATE,
+            "speculative state can only be captured at a stable prompt boundary");
+    }
+    try {
+        std::vector<uint8_t> data;
+        *out_has_state = common_speculative_get_state(spec->spec, seq_id, data);
+        *out_size = data.size();
+        if (data.size() > out_capacity) {
+            return llama_rs_chat_set_error(
+                out_error,
+                LLAMA_RS_STATUS_ALLOCATION_FAILED,
+                "speculative state exceeds output capacity");
+        }
+        if (!data.empty() && !out_data) {
+            return llama_rs_chat_set_error(
+                out_error,
+                LLAMA_RS_STATUS_INVALID_ARGUMENT,
+                "speculative state output is null");
+        }
+        if (!data.empty()) {
+            std::memcpy(out_data, data.data(), data.size());
+        }
+        return LLAMA_RS_STATUS_OK;
+    } catch (...) {
+        return llama_rs_chat_current_exception(out_error);
+    }
+}
+
+extern "C" llama_rs_status llama_rs_speculative_state_set(
+    struct llama_rs_speculative * spec,
+    llama_seq_id seq_id,
+    const uint8_t * data,
+    size_t data_size,
+    bool has_state,
+    char ** out_error) {
+    if (out_error) {
+        *out_error = nullptr;
+    }
+    if (!spec || !spec->spec || (data_size > 0 && !data) || seq_id < 0 ||
+        static_cast<size_t>(seq_id) >= spec->sequences.size()) {
+        return llama_rs_chat_set_error(
+            out_error,
+            LLAMA_RS_STATUS_INVALID_ARGUMENT,
+            "invalid speculative state-set arguments");
+    }
+    if (spec->sequences[seq_id].draft_pending || spec->sequences[seq_id].prepared) {
+        return llama_rs_chat_set_error(
+            out_error,
+            LLAMA_RS_STATUS_INVALID_STATE,
+            "speculative state can only be restored at a stable prompt boundary");
+    }
+    try {
+        if (has_state) {
+            std::vector<uint8_t> state;
+            if (data_size > 0) {
+                state.assign(data, data + data_size);
+            }
+            common_speculative_set_state(spec->spec, seq_id, state);
+        }
+        return LLAMA_RS_STATUS_OK;
     } catch (...) {
         return llama_rs_chat_current_exception(out_error);
     }

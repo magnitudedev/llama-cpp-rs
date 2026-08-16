@@ -19,7 +19,7 @@ use crate::context::params::FlashAttentionPolicy;
 use crate::context::LlamaContext;
 use crate::model::LlamaModel;
 #[cfg(feature = "common")]
-use crate::speculative::SpeculativeOperations;
+use crate::speculative::{SpeculativeOperations, SpeculativePosition};
 use crate::token::LlamaToken;
 
 // Upstream `mtmd_get_memory_usage` temporarily replaces mtmd's process-global callback/userdata
@@ -816,6 +816,22 @@ pub struct MtmdChunkEvalParams {
     pub logits_last: bool,
 }
 
+/// Coordinates one multimodal chunk evaluation across linked target and draft contexts.
+#[cfg(feature = "common")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MtmdSpeculativeChunkEvalParams {
+    /// Index of the text or media chunk to evaluate.
+    pub index: usize,
+    /// Linked target-native and draft-sequential starting positions.
+    pub position: SpeculativePosition,
+    /// Native sequence identifier that owns the decoded state.
+    pub seq_id: i32,
+    /// Maximum logical batch size passed to llama.cpp.
+    pub n_batch: i32,
+    /// Whether the final token in this chunk should produce logits.
+    pub logits_last: bool,
+}
+
 impl MtmdInputChunks {
     /// Create a new empty input chunks collection
     ///
@@ -1105,11 +1121,11 @@ impl MtmdInputChunks {
         &self,
         mtmd_ctx: &mut MtmdContext<'_>,
         speculative: &mut SpeculativeOperations<'_>,
-        n_past: i32,
+        position: SpeculativePosition,
         seq_id: i32,
         n_batch: i32,
         logits_last: bool,
-    ) -> Result<i32, MtmdEvalError> {
+    ) -> Result<SpeculativePosition, MtmdEvalError> {
         if n_batch <= 0 {
             return Err(MtmdEvalError::InvalidBatchSize(n_batch));
         }
@@ -1120,7 +1136,8 @@ impl MtmdInputChunks {
             std::ptr::from_ref(mtmd_ctx.model),
             speculative.target_model_ptr(),
         )?;
-        let mut new_n_past = n_past;
+        let mut new_target_n_past = position.target;
+        let mut new_draft_n_past = position.draft;
         let mut result = 0;
         let mut error = ptr::null_mut();
         let _native_guard = mtmd_native_read();
@@ -1130,18 +1147,23 @@ impl MtmdInputChunks {
                 speculative.target_context_ptr(),
                 speculative.native_ptr(),
                 self.chunks.as_ptr(),
-                n_past,
+                position.target,
+                position.draft,
                 seq_id,
                 n_batch,
                 logits_last,
-                &raw mut new_n_past,
+                &raw mut new_target_n_past,
+                &raw mut new_draft_n_past,
                 &raw mut result,
                 &raw mut error,
             )
         };
         check_mtmd_native_status(status, error)?;
         if result == 0 {
-            Ok(new_n_past)
+            Ok(SpeculativePosition {
+                target: new_target_n_past,
+                draft: new_draft_n_past,
+            })
         } else {
             Err(MtmdEvalError::EvalFailure(result))
         }
@@ -1158,11 +1180,11 @@ impl MtmdInputChunks {
         &self,
         mtmd_ctx: &mut MtmdContext<'_>,
         speculative: &mut SpeculativeOperations<'_>,
-        params: MtmdChunkEvalParams,
-    ) -> Result<i32, MtmdEvalError> {
-        let MtmdChunkEvalParams {
+        params: MtmdSpeculativeChunkEvalParams,
+    ) -> Result<SpeculativePosition, MtmdEvalError> {
+        let MtmdSpeculativeChunkEvalParams {
             index,
-            n_past,
+            position,
             seq_id,
             n_batch,
             logits_last,
@@ -1185,7 +1207,8 @@ impl MtmdInputChunks {
         }
 
         let _native_guard = mtmd_native_read();
-        let mut new_n_past = n_past;
+        let mut new_target_n_past = position.target;
+        let mut new_draft_n_past = position.draft;
         let mut result = 0;
         let mut error = ptr::null_mut();
         let status = unsafe {
@@ -1194,18 +1217,23 @@ impl MtmdInputChunks {
                 speculative.target_context_ptr(),
                 speculative.native_ptr(),
                 chunk.chunk.as_ptr(),
-                n_past,
+                position.target,
+                position.draft,
                 seq_id,
                 n_batch,
                 logits_last,
-                &raw mut new_n_past,
+                &raw mut new_target_n_past,
+                &raw mut new_draft_n_past,
                 &raw mut result,
                 &raw mut error,
             )
         };
         check_mtmd_native_status(status, error)?;
         if result == 0 {
-            Ok(new_n_past)
+            Ok(SpeculativePosition {
+                target: new_target_n_past,
+                draft: new_draft_n_past,
+            })
         } else {
             Err(MtmdEvalError::EvalFailure(result))
         }
@@ -2089,7 +2117,8 @@ mod tests {
     #[test]
     fn speculative_single_chunk_bridge_rejects_null_arguments() {
         let _native_guard = mtmd_native_read();
-        let mut new_n_past = 0;
+        let mut new_target_n_past = 0;
+        let mut new_draft_n_past = 0;
         let mut result = 0;
         let mut error = ptr::null_mut();
         let status = unsafe {
@@ -2100,9 +2129,11 @@ mod tests {
                 ptr::null(),
                 0,
                 0,
+                0,
                 1,
                 false,
-                &raw mut new_n_past,
+                &raw mut new_target_n_past,
+                &raw mut new_draft_n_past,
                 &raw mut result,
                 &raw mut error,
             )

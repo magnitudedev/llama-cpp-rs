@@ -72,12 +72,15 @@ llama_rs_status llama_rs_speculative_begin(
 llama_rs_status llama_rs_speculative_process(
     struct llama_rs_speculative * spec,
     const struct llama_batch * batch,
+    const llama_pos * draft_positions,
+    size_t draft_positions_count,
     char ** out_error);
 
 llama_rs_status llama_rs_speculative_prepare_draft(
     struct llama_rs_speculative * spec,
     llama_seq_id seq_id,
-    llama_pos n_past,
+    llama_pos target_n_past,
+    llama_pos draft_n_past,
     llama_token id_last,
     const llama_token * prompt_tokens,
     size_t prompt_tokens_count,
@@ -101,15 +104,42 @@ llama_rs_status llama_rs_speculative_resolve(
     llama_seq_id seq_id,
     size_t proposed_count,
     uint16_t accepted_count,
-    llama_pos next_position,
+    llama_pos next_target_position,
+    llama_pos next_draft_position,
     bool * out_replay,
     char ** out_error);
 
 llama_rs_status llama_rs_speculative_seq_rm(
     struct llama_rs_speculative * spec,
     llama_seq_id seq_id,
-    llama_pos p0,
-    llama_pos p1,
+    llama_pos target_p0,
+    llama_pos target_p1,
+    llama_pos draft_p0,
+    llama_pos draft_p1,
+    char ** out_error);
+
+llama_rs_status llama_rs_speculative_state_size(
+    struct llama_rs_speculative * spec,
+    llama_seq_id seq_id,
+    size_t * out_size,
+    bool * out_has_state,
+    char ** out_error);
+
+llama_rs_status llama_rs_speculative_state_get(
+    struct llama_rs_speculative * spec,
+    llama_seq_id seq_id,
+    uint8_t * out_data,
+    size_t out_capacity,
+    size_t * out_size,
+    bool * out_has_state,
+    char ** out_error);
+
+llama_rs_status llama_rs_speculative_state_set(
+    struct llama_rs_speculative * spec,
+    llama_seq_id seq_id,
+    const uint8_t * data,
+    size_t data_size,
+    bool has_state,
     char ** out_error);
 
 #ifdef __cplusplus

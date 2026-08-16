@@ -10,6 +10,7 @@ use crate::llama_batch::LlamaBatch;
 use crate::model::LlamaModel;
 use crate::status_is_ok;
 use crate::token::LlamaToken;
+use crate::{LlamaSequenceState, LlamaStateSeqFlags};
 
 pub use crate::speculative_preflight::{
     preflight_speculative, SpeculativePreflight, SpeculativePreflightError,
@@ -101,6 +102,30 @@ pub enum SpeculativeVerificationResolution {
     Committed,
 }
 
+/// The same semantic boundary expressed in the target model's native coordinate system and the
+/// linked draft model's ordinary sequential coordinate system.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SpeculativePosition {
+    /// Position used by the target context. Multimodal targets may use M-RoPE coordinates.
+    pub target: i32,
+    /// Position used by the linked draft context. This is always a consecutive token index.
+    pub draft: i32,
+}
+
+#[derive(Clone, Debug)]
+enum SpeculativeMethodState {
+    Stateless,
+    Stateful(Vec<u8>),
+}
+
+/// An indivisible snapshot of target, draft, and method-owned state at a stable prompt boundary.
+#[derive(Clone, Debug)]
+pub struct SpeculativePromptState {
+    target: LlamaSequenceState,
+    draft: LlamaSequenceState,
+    method: SpeculativeMethodState,
+}
+
 /// Errors returned by the speculative wrapper.
 #[derive(Debug, Eq, PartialEq, thiserror::Error)]
 pub enum SpeculativeError {
@@ -123,6 +148,12 @@ pub enum SpeculativeError {
     /// The draft output exceeded the caller-provided bound.
     #[error("llama.cpp speculative draft exceeded configured maximum")]
     DraftOverflow,
+    /// A linked target/draft sequence snapshot could not be captured.
+    #[error("failed to capture speculative sequence state: {0}")]
+    StateCapture(String),
+    /// A linked target/draft sequence snapshot could not be restored.
+    #[error("failed to restore speculative sequence state")]
+    StateRestore,
 }
 
 /// RAII owner for a model-backed speculative context.
@@ -314,11 +345,18 @@ impl<'model> SpeculativeSession<'model> {
     /// # Errors
     ///
     /// Returns an error if llama.cpp cannot update the speculative draft context.
-    pub fn process(&mut self, batch: &LlamaBatch<'_>) -> Result<(), SpeculativeError> {
+    pub fn process(
+        &mut self,
+        batch: &LlamaBatch<'_>,
+        draft_positions: &[i32],
+    ) -> Result<(), SpeculativeError> {
+        validate_draft_positions(batch, draft_positions)?;
         native_call("process", |out_error| unsafe {
             llama_cpp_sys_2::llama_rs_speculative_process(
                 self.raw.as_ptr(),
                 std::ptr::from_ref(&batch.raw),
+                draft_positions.as_ptr(),
+                draft_positions.len(),
                 out_error,
             )
         })
@@ -333,12 +371,12 @@ impl<'model> SpeculativeSession<'model> {
     pub fn prepare_draft(
         &mut self,
         sequence_id: i32,
-        n_past: i32,
+        position: SpeculativePosition,
         id_last: LlamaToken,
         prompt_tokens: &[LlamaToken],
         n_max: usize,
     ) -> Result<(), SpeculativeError> {
-        if n_past < 0 {
+        if position.target < 0 || position.draft < 0 {
             return Err(SpeculativeError::InvalidParams);
         }
         self.validate_sequence(sequence_id)?;
@@ -352,7 +390,8 @@ impl<'model> SpeculativeSession<'model> {
             llama_cpp_sys_2::llama_rs_speculative_prepare_draft(
                 self.raw.as_ptr(),
                 sequence_id,
-                n_past,
+                position.target,
+                position.draft,
                 id_last.0,
                 prompt.as_ptr(),
                 prompt.len(),
@@ -400,7 +439,7 @@ impl<'model> SpeculativeSession<'model> {
         sequence_id: i32,
         proposed_count: usize,
         accepted_count: usize,
-        next_position: i32,
+        next_position: SpeculativePosition,
     ) -> Result<SpeculativeVerificationResolution, SpeculativeError> {
         self.validate_sequence(sequence_id)?;
         resolve_verification(
@@ -468,11 +507,18 @@ impl SpeculativeOperations<'_> {
     }
 
     /// Mirror a target batch into the linked speculative context.
-    pub fn process(&mut self, batch: &LlamaBatch<'_>) -> Result<(), SpeculativeError> {
+    pub fn process(
+        &mut self,
+        batch: &LlamaBatch<'_>,
+        draft_positions: &[i32],
+    ) -> Result<(), SpeculativeError> {
+        validate_draft_positions(batch, draft_positions)?;
         native_call("process", |out_error| unsafe {
             llama_cpp_sys_2::llama_rs_speculative_process(
                 self.raw.as_ptr(),
                 std::ptr::from_ref(&batch.raw),
+                draft_positions.as_ptr(),
+                draft_positions.len(),
                 out_error,
             )
         })
@@ -482,13 +528,13 @@ impl SpeculativeOperations<'_> {
     pub fn prepare_draft(
         &mut self,
         sequence_id: i32,
-        n_past: i32,
+        position: SpeculativePosition,
         id_last: LlamaToken,
         prompt_tokens: &[LlamaToken],
         n_max: usize,
     ) -> Result<(), SpeculativeError> {
         validate_sequence(self.n_seq, sequence_id)?;
-        if n_past < 0 || n_max == 0 || n_max > self.n_max {
+        if position.target < 0 || position.draft < 0 || n_max == 0 || n_max > self.n_max {
             return Err(SpeculativeError::InvalidParams);
         }
         let prompt = tokens_to_raw(prompt_tokens);
@@ -497,7 +543,8 @@ impl SpeculativeOperations<'_> {
             llama_cpp_sys_2::llama_rs_speculative_prepare_draft(
                 self.raw.as_ptr(),
                 sequence_id,
-                n_past,
+                position.target,
+                position.draft,
                 id_last.0,
                 prompt.as_ptr(),
                 prompt.len(),
@@ -545,7 +592,7 @@ impl SpeculativeOperations<'_> {
         sequence_id: i32,
         proposed_count: usize,
         accepted_count: usize,
-        next_position: i32,
+        next_position: SpeculativePosition,
     ) -> Result<SpeculativeVerificationResolution, SpeculativeError> {
         validate_sequence(self.n_seq, sequence_id)?;
         resolve_verification(
@@ -557,23 +604,104 @@ impl SpeculativeOperations<'_> {
         )
     }
 
-    /// Remove the same position range from both target and draft memories.
+    /// Remove corresponding ranges from target and draft memories.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the sequence or either linked range is invalid, or when either
+    /// native memory rejects the removal.
     pub fn remove_sequence_range(
         &mut self,
         sequence_id: i32,
-        start: i32,
-        end: i32,
+        start: SpeculativePosition,
+        end: Option<SpeculativePosition>,
     ) -> Result<(), SpeculativeError> {
         validate_sequence(self.n_seq, sequence_id)?;
         native_call("remove sequence range", |out_error| unsafe {
             llama_cpp_sys_2::llama_rs_speculative_seq_rm(
                 self.raw.as_ptr(),
                 sequence_id,
-                start,
-                end,
+                start.target,
+                end.map_or(-1, |position| position.target),
+                start.draft,
+                end.map_or(-1, |position| position.draft),
                 out_error,
             )
         })
+    }
+
+    /// Capture target, draft, and method-owned state at a stable prompt boundary.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the sequence is invalid, either native snapshot is unavailable, or
+    /// method-owned state cannot be captured at the current boundary.
+    pub fn capture_prompt_state(
+        &mut self,
+        target_context: &LlamaContext<'_>,
+        draft_context: &LlamaContext<'_>,
+        sequence_id: i32,
+    ) -> Result<SpeculativePromptState, SpeculativeError> {
+        validate_sequence(self.n_seq, sequence_id)?;
+        let target = target_context
+            .capture_sequence_state(sequence_id, LlamaStateSeqFlags::PARTIAL_ONLY)
+            .map_err(|error| SpeculativeError::StateCapture(error.to_string()))?;
+        let draft = draft_context
+            .capture_sequence_state(sequence_id, LlamaStateSeqFlags::PARTIAL_ONLY)
+            .map_err(|error| SpeculativeError::StateCapture(error.to_string()))?;
+        if target.is_empty() || draft.is_empty() {
+            return Err(SpeculativeError::StateCapture(
+                "native target or draft snapshot was empty".to_owned(),
+            ));
+        }
+        let method = capture_method_state(self.raw.as_ptr(), sequence_id)?;
+        Ok(SpeculativePromptState {
+            target,
+            draft,
+            method,
+        })
+    }
+
+    /// Restore a linked prompt snapshot. A rejected component clears both memories so partial
+    /// restoration is never exposed to the caller as usable state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the sequence is invalid or any target, draft, or method-owned state
+    /// component cannot be restored. A failed restore clears both linked memories.
+    pub fn restore_prompt_state(
+        &mut self,
+        target_context: &mut LlamaContext<'_>,
+        draft_context: &mut LlamaContext<'_>,
+        sequence_id: i32,
+        state: &SpeculativePromptState,
+    ) -> Result<(), SpeculativeError> {
+        validate_sequence(self.n_seq, sequence_id)?;
+        let restored = target_context.restore_sequence_state(&state.target, sequence_id)
+            && draft_context.restore_sequence_state(&state.draft, sequence_id);
+        if !restored {
+            let _ = self.remove_sequence_range(
+                sequence_id,
+                SpeculativePosition {
+                    target: 0,
+                    draft: 0,
+                },
+                None,
+            );
+            return Err(SpeculativeError::StateRestore);
+        }
+        if let Err(error) = restore_method_state(self.raw.as_ptr(), sequence_id, &state.method) {
+            let _ = self.remove_sequence_range(
+                sequence_id,
+                SpeculativePosition {
+                    target: 0,
+                    draft: 0,
+                },
+                None,
+            );
+            return Err(error);
+        }
+        Ok(())
     }
 }
 
@@ -594,9 +722,13 @@ fn resolve_verification(
     sequence_id: i32,
     proposed_count: usize,
     accepted_count: usize,
-    next_position: i32,
+    next_position: SpeculativePosition,
 ) -> Result<SpeculativeVerificationResolution, SpeculativeError> {
-    if proposed_count == 0 || accepted_count > proposed_count || next_position < 0 {
+    if proposed_count == 0
+        || accepted_count > proposed_count
+        || next_position.target < 0
+        || next_position.draft < 0
+    {
         return Err(SpeculativeError::InvalidParams);
     }
     let accepted_count =
@@ -608,7 +740,8 @@ fn resolve_verification(
             sequence_id,
             proposed_count,
             accepted_count,
-            next_position,
+            next_position.target,
+            next_position.draft,
             &raw mut replay,
             out_error,
         )
@@ -617,6 +750,80 @@ fn resolve_verification(
         SpeculativeVerificationResolution::Replay
     } else {
         SpeculativeVerificationResolution::Committed
+    })
+}
+
+fn validate_draft_positions(
+    batch: &LlamaBatch<'_>,
+    draft_positions: &[i32],
+) -> Result<(), SpeculativeError> {
+    if draft_positions.len() != usize::try_from(batch.n_tokens()).unwrap_or(usize::MAX)
+        || draft_positions.iter().any(|position| *position < 0)
+    {
+        Err(SpeculativeError::InvalidParams)
+    } else {
+        Ok(())
+    }
+}
+
+fn capture_method_state(
+    raw: *mut llama_cpp_sys_2::llama_rs_speculative,
+    sequence_id: i32,
+) -> Result<SpeculativeMethodState, SpeculativeError> {
+    let mut size = 0;
+    let mut has_state = false;
+    native_call("get state size", |out_error| unsafe {
+        llama_cpp_sys_2::llama_rs_speculative_state_size(
+            raw,
+            sequence_id,
+            &raw mut size,
+            &raw mut has_state,
+            out_error,
+        )
+    })?;
+    if !has_state {
+        return Ok(SpeculativeMethodState::Stateless);
+    }
+    let mut data = vec![0_u8; size];
+    let mut written = 0;
+    native_call("get state", |out_error| unsafe {
+        llama_cpp_sys_2::llama_rs_speculative_state_get(
+            raw,
+            sequence_id,
+            data.as_mut_ptr(),
+            data.len(),
+            &raw mut written,
+            &raw mut has_state,
+            out_error,
+        )
+    })?;
+    if !has_state || written > data.len() {
+        return Err(SpeculativeError::StateCapture(
+            "native method state changed during capture".to_owned(),
+        ));
+    }
+    data.truncate(written);
+    Ok(SpeculativeMethodState::Stateful(data))
+}
+
+fn restore_method_state(
+    raw: *mut llama_cpp_sys_2::llama_rs_speculative,
+    sequence_id: i32,
+    state: &SpeculativeMethodState,
+) -> Result<(), SpeculativeError> {
+    let (data, has_state) = match state {
+        SpeculativeMethodState::Stateless => (&[][..], false),
+        SpeculativeMethodState::Stateful(data) => (data.as_slice(), true),
+    };
+    native_call("set state", |out_error| unsafe {
+        llama_cpp_sys_2::llama_rs_speculative_state_set(
+            raw,
+            sequence_id,
+            data.as_ptr(),
+            data.len(),
+            has_state,
+            out_error,
+        )
     })
 }
 
@@ -674,7 +881,13 @@ mod tests {
     #[test]
     fn native_speculative_error_preserves_operation_status_and_message() {
         let error = native_call("process", |out_error| unsafe {
-            llama_cpp_sys_2::llama_rs_speculative_process(ptr::null_mut(), ptr::null(), out_error)
+            llama_cpp_sys_2::llama_rs_speculative_process(
+                ptr::null_mut(),
+                ptr::null(),
+                ptr::null(),
+                0,
+                out_error,
+            )
         })
         .unwrap_err();
 
@@ -685,6 +898,23 @@ mod tests {
                 status: llama_cpp_sys_2::LLAMA_RS_STATUS_INVALID_ARGUMENT,
                 message: "invalid speculative process arguments".to_owned(),
             }
+        );
+    }
+
+    #[test]
+    fn draft_position_view_must_cover_every_batch_row() {
+        let mut batch = LlamaBatch::new(2, 1);
+        batch.add(LlamaToken(1), 70, &[0], false).unwrap();
+        batch.add(LlamaToken(2), 71, &[0], false).unwrap();
+
+        assert_eq!(validate_draft_positions(&batch, &[4_000, 4_001]), Ok(()));
+        assert_eq!(
+            validate_draft_positions(&batch, &[4_000]),
+            Err(SpeculativeError::InvalidParams)
+        );
+        assert_eq!(
+            validate_draft_positions(&batch, &[4_000, -1]),
+            Err(SpeculativeError::InvalidParams)
         );
     }
 
