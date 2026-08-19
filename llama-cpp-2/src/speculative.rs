@@ -37,6 +37,75 @@ pub enum SpeculativeMethod {
     },
 }
 
+/// One sparse proposal distribution emitted for a speculative token.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SpeculativeTokenDistribution {
+    ids: Vec<LlamaToken>,
+    probabilities: Vec<f32>,
+}
+
+impl SpeculativeTokenDistribution {
+    pub(crate) fn ids(&self) -> &[LlamaToken] {
+        &self.ids
+    }
+
+    pub(crate) fn probabilities(&self) -> &[f32] {
+        &self.probabilities
+    }
+}
+
+/// Tokens proposed by a speculative method and their optional proposal distributions.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct SpeculativeDraft {
+    tokens: Vec<LlamaToken>,
+    distributions: Vec<SpeculativeTokenDistribution>,
+}
+
+impl SpeculativeDraft {
+    /// Construct a draft without proposal distributions, such as a replay draft.
+    #[must_use]
+    pub fn from_tokens(tokens: Vec<LlamaToken>) -> Self {
+        Self {
+            tokens,
+            distributions: Vec::new(),
+        }
+    }
+
+    /// Proposed token sequence.
+    #[must_use]
+    pub fn tokens(&self) -> &[LlamaToken] {
+        &self.tokens
+    }
+
+    /// Number of proposed tokens.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.tokens.len()
+    }
+
+    /// Whether this proposal contains no tokens.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.tokens.is_empty()
+    }
+
+    /// Whether the drafter supplied one sparse proposal distribution per token.
+    #[must_use]
+    pub fn has_proposal_distributions(&self) -> bool {
+        !self.distributions.is_empty()
+    }
+
+    /// Remove all tokens and proposal distributions.
+    pub fn clear(&mut self) {
+        self.tokens.clear();
+        self.distributions.clear();
+    }
+
+    pub(crate) fn distributions(&self) -> &[SpeculativeTokenDistribution] {
+        &self.distributions
+    }
+}
+
 impl SpeculativeMethod {
     pub(crate) fn native(self) -> llama_cpp_sys_2::llama_rs_speculative_method {
         match self {
@@ -375,6 +444,8 @@ impl<'model> SpeculativeSession<'model> {
         id_last: LlamaToken,
         prompt_tokens: &[LlamaToken],
         n_max: usize,
+        temperature: f32,
+        seed: u32,
     ) -> Result<(), SpeculativeError> {
         if position.target < 0 || position.draft < 0 {
             return Err(SpeculativeError::InvalidParams);
@@ -396,6 +467,8 @@ impl<'model> SpeculativeSession<'model> {
                 prompt.as_ptr(),
                 prompt.len(),
                 n_max,
+                temperature,
+                seed,
                 out_error,
             )
         })
@@ -409,28 +482,9 @@ impl<'model> SpeculativeSession<'model> {
     }
 
     /// Copy the most recently generated draft for one sequence.
-    pub fn take_draft(&mut self, sequence_id: i32) -> Result<Vec<LlamaToken>, SpeculativeError> {
+    pub fn take_draft(&mut self, sequence_id: i32) -> Result<SpeculativeDraft, SpeculativeError> {
         self.validate_sequence(sequence_id)?;
-        let mut raw_out = vec![0; self.n_max];
-        let mut out_len = 0_usize;
-        let mut native_error = ptr::null_mut();
-        let status = unsafe {
-            llama_cpp_sys_2::llama_rs_speculative_get_draft(
-                self.raw.as_ptr(),
-                sequence_id,
-                raw_out.as_mut_ptr(),
-                raw_out.len(),
-                &raw mut out_len,
-                &raw mut native_error,
-            )
-        };
-        if status == llama_cpp_sys_2::LLAMA_RS_STATUS_ALLOCATION_FAILED {
-            take_native_error(native_error);
-            return Err(SpeculativeError::DraftOverflow);
-        }
-        status_to_result("get draft", status, native_error)?;
-        raw_out.truncate(out_len);
-        Ok(raw_out.into_iter().map(LlamaToken).collect())
+        take_native_draft(self.raw.as_ptr(), sequence_id, self.n_max)
     }
 
     /// Atomically commit a verified prefix or restore the checkpoint for replay.
@@ -532,6 +586,8 @@ impl SpeculativeOperations<'_> {
         id_last: LlamaToken,
         prompt_tokens: &[LlamaToken],
         n_max: usize,
+        temperature: f32,
+        seed: u32,
     ) -> Result<(), SpeculativeError> {
         validate_sequence(self.n_seq, sequence_id)?;
         if position.target < 0 || position.draft < 0 || n_max == 0 || n_max > self.n_max {
@@ -549,6 +605,8 @@ impl SpeculativeOperations<'_> {
                 prompt.as_ptr(),
                 prompt.len(),
                 n_max,
+                temperature,
+                seed,
                 out_error,
             )
         })
@@ -562,28 +620,9 @@ impl SpeculativeOperations<'_> {
     }
 
     /// Take the draft generated for one sequence.
-    pub fn take_draft(&mut self, sequence_id: i32) -> Result<Vec<LlamaToken>, SpeculativeError> {
+    pub fn take_draft(&mut self, sequence_id: i32) -> Result<SpeculativeDraft, SpeculativeError> {
         validate_sequence(self.n_seq, sequence_id)?;
-        let mut raw_out = vec![0; self.n_max];
-        let mut out_len = 0;
-        let mut native_error = ptr::null_mut();
-        let status = unsafe {
-            llama_cpp_sys_2::llama_rs_speculative_get_draft(
-                self.raw.as_ptr(),
-                sequence_id,
-                raw_out.as_mut_ptr(),
-                raw_out.len(),
-                &raw mut out_len,
-                &raw mut native_error,
-            )
-        };
-        if status == llama_cpp_sys_2::LLAMA_RS_STATUS_ALLOCATION_FAILED {
-            take_native_error(native_error);
-            return Err(SpeculativeError::DraftOverflow);
-        }
-        status_to_result("get draft", status, native_error)?;
-        raw_out.truncate(out_len);
-        Ok(raw_out.into_iter().map(LlamaToken).collect())
+        take_native_draft(self.raw.as_ptr(), sequence_id, self.n_max)
     }
 
     /// Atomically commit a verified prefix or restore the checkpoint for replay.
@@ -827,6 +866,87 @@ fn restore_method_state(
     })
 }
 
+fn take_native_draft(
+    raw: *mut llama_cpp_sys_2::llama_rs_speculative,
+    sequence_id: i32,
+    n_max: usize,
+) -> Result<SpeculativeDraft, SpeculativeError> {
+    let mut raw_tokens = vec![0; n_max];
+    let mut token_count = 0_usize;
+    let mut native_error = ptr::null_mut();
+    let status = unsafe {
+        llama_cpp_sys_2::llama_rs_speculative_get_draft(
+            raw,
+            sequence_id,
+            raw_tokens.as_mut_ptr(),
+            raw_tokens.len(),
+            &raw mut token_count,
+            &raw mut native_error,
+        )
+    };
+    if status == llama_cpp_sys_2::LLAMA_RS_STATUS_ALLOCATION_FAILED {
+        take_native_error(native_error);
+        return Err(SpeculativeError::DraftOverflow);
+    }
+    status_to_result("get draft", status, native_error)?;
+    raw_tokens.truncate(token_count);
+
+    let mut distribution_count = 0_usize;
+    let mut candidate_count = 0_usize;
+    native_call("get draft distribution sizes", |out_error| unsafe {
+        llama_cpp_sys_2::llama_rs_speculative_get_draft_distribution_sizes(
+            raw,
+            sequence_id,
+            &raw mut distribution_count,
+            &raw mut candidate_count,
+            out_error,
+        )
+    })?;
+    if distribution_count == 0 {
+        return Ok(SpeculativeDraft::from_tokens(
+            raw_tokens.into_iter().map(LlamaToken).collect(),
+        ));
+    }
+    if distribution_count != token_count {
+        return Err(SpeculativeError::Native {
+            operation: "get draft distributions",
+            status: llama_cpp_sys_2::LLAMA_RS_STATUS_INVALID_STATE,
+            message: "proposal distribution count does not match draft token count".to_owned(),
+        });
+    }
+
+    let mut offsets = vec![0_usize; distribution_count + 1];
+    let mut ids = vec![0; candidate_count];
+    let mut probabilities = vec![0.0_f32; candidate_count];
+    native_call("get draft distributions", |out_error| unsafe {
+        llama_cpp_sys_2::llama_rs_speculative_get_draft_distributions(
+            raw,
+            sequence_id,
+            offsets.as_mut_ptr(),
+            offsets.len(),
+            ids.as_mut_ptr(),
+            probabilities.as_mut_ptr(),
+            candidate_count,
+            out_error,
+        )
+    })?;
+    let distributions = offsets
+        .windows(2)
+        .map(|range| SpeculativeTokenDistribution {
+            ids: ids[range[0]..range[1]]
+                .iter()
+                .copied()
+                .map(LlamaToken)
+                .collect(),
+            probabilities: probabilities[range[0]..range[1]].to_vec(),
+        })
+        .collect();
+    Ok(SpeculativeDraft {
+        tokens: raw_tokens.into_iter().map(LlamaToken).collect(),
+        distributions,
+    })
+}
+
 fn native_call(
     operation: &'static str,
     call: impl FnOnce(*mut *mut c_char) -> llama_cpp_sys_2::llama_rs_status,
@@ -877,6 +997,15 @@ fn validate_sequence(n_seq: u32, sequence_id: i32) -> Result<(), SpeculativeErro
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn replay_draft_has_no_proposal_distributions() {
+        let mut draft = SpeculativeDraft::from_tokens(vec![LlamaToken(1), LlamaToken(2)]);
+        assert_eq!(draft.tokens(), &[LlamaToken(1), LlamaToken(2)]);
+        assert!(!draft.has_proposal_distributions());
+        draft.clear();
+        assert!(draft.is_empty());
+    }
 
     #[test]
     fn native_speculative_error_preserves_operation_status_and_message() {

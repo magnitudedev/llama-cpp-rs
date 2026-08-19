@@ -15,6 +15,7 @@
 
 #include "llama.cpp/common/common.h"
 #include "llama.cpp/common/sampling.h"
+#include "llama.cpp/common/speculative.h"
 #include "llama.cpp/include/llama.h"
 #include "wrapper_utils.h"
 
@@ -579,6 +580,72 @@ extern "C" llama_rs_status llama_rs_common_sampler_sample_and_accept_n(
                 out_error,
                 LLAMA_RS_STATUS_ALLOCATION_FAILED,
                 "accepted speculative output exceeded capacity");
+        }
+        std::copy(accepted.begin(), accepted.end(), out_tokens);
+        if (!accepted.empty()) {
+            sampler->last = accepted.back();
+            sampler->has_last = true;
+        }
+        return LLAMA_RS_STATUS_OK;
+    } catch (...) {
+        return llama_rs_chat_current_exception(out_error);
+    }
+}
+
+extern "C" llama_rs_status llama_rs_common_sampler_sample_and_accept_draft(
+    struct llama_rs_common_sampler * sampler,
+    struct llama_context * context,
+    const int32_t * indices,
+    size_t indices_count,
+    const llama_token * draft,
+    size_t draft_count,
+    const size_t * distribution_offsets,
+    size_t distribution_offsets_count,
+    const llama_token * distribution_ids,
+    const float * distribution_probabilities,
+    size_t distribution_candidate_count,
+    bool grammar_first,
+    llama_token * out_tokens,
+    size_t out_tokens_capacity,
+    size_t * out_tokens_count,
+    char ** out_error) {
+    if (out_error) {
+        *out_error = nullptr;
+    }
+    if (!sampler || !sampler->value || !context || !indices || indices_count != draft_count + 1 ||
+        (!draft && draft_count > 0) || distribution_offsets_count != draft_count + 1 ||
+        !distribution_offsets || distribution_offsets[0] != 0 ||
+        distribution_offsets[draft_count] != distribution_candidate_count ||
+        (distribution_candidate_count > 0 && (!distribution_ids || !distribution_probabilities)) ||
+        !out_tokens_count || out_tokens_capacity < indices_count || !out_tokens) {
+        return llama_rs_chat_set_error(out_error, LLAMA_RS_STATUS_INVALID_ARGUMENT, "invalid distributed speculative sampler arguments");
+    }
+    try {
+        const std::vector<int32_t> index_values(indices, indices + indices_count);
+        llama_tokens draft_values;
+        if (draft_count > 0) {
+            draft_values.assign(draft, draft + draft_count);
+        }
+        std::vector<common_speculative_token_dist> distributions;
+        distributions.reserve(draft_count);
+        for (size_t i = 0; i < draft_count; ++i) {
+            const size_t begin = distribution_offsets[i];
+            const size_t end = distribution_offsets[i + 1];
+            if (begin > end || end > distribution_candidate_count) {
+                return llama_rs_chat_set_error(out_error, LLAMA_RS_STATUS_INVALID_ARGUMENT, "invalid speculative distribution offsets");
+            }
+            common_speculative_token_dist distribution;
+            if (begin < end) {
+                distribution.ids.assign(distribution_ids + begin, distribution_ids + end);
+                distribution.probs.assign(distribution_probabilities + begin, distribution_probabilities + end);
+            }
+            distributions.push_back(std::move(distribution));
+        }
+        const auto accepted = common_sampler_sample_and_accept_n(
+            sampler->value, context, index_values, draft_values, distributions, grammar_first);
+        *out_tokens_count = accepted.size();
+        if (accepted.size() > out_tokens_capacity) {
+            return llama_rs_chat_set_error(out_error, LLAMA_RS_STATUS_ALLOCATION_FAILED, "accepted speculative output exceeded capacity");
         }
         std::copy(accepted.begin(), accepted.end(), out_tokens);
         if (!accepted.empty()) {

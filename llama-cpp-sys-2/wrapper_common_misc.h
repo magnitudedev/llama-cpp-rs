@@ -85,6 +85,8 @@ llama_rs_status llama_rs_speculative_prepare_draft(
     const llama_token * prompt_tokens,
     size_t prompt_tokens_count,
     int32_t n_max,
+    float temperature,
+    uint32_t seed,
     char ** out_error);
 
 llama_rs_status llama_rs_speculative_draft(
@@ -97,6 +99,23 @@ llama_rs_status llama_rs_speculative_get_draft(
     llama_token * out_tokens,
     size_t out_tokens_capacity,
     size_t * out_tokens_count,
+    char ** out_error);
+
+llama_rs_status llama_rs_speculative_get_draft_distribution_sizes(
+    struct llama_rs_speculative * spec,
+    llama_seq_id seq_id,
+    size_t * out_distribution_count,
+    size_t * out_candidate_count,
+    char ** out_error);
+
+llama_rs_status llama_rs_speculative_get_draft_distributions(
+    struct llama_rs_speculative * spec,
+    llama_seq_id seq_id,
+    size_t * out_offsets,
+    size_t out_offsets_capacity,
+    llama_token * out_ids,
+    float * out_probabilities,
+    size_t out_candidates_capacity,
     char ** out_error);
 
 llama_rs_status llama_rs_speculative_resolve(

@@ -124,6 +124,7 @@ struct llama_rs_speculative {
     struct sequence_state {
         std::vector<llama_token> prompt;
         std::vector<llama_token> draft;
+        std::vector<common_speculative_token_dist> draft_distributions;
         common_prompt_checkpoint target_checkpoint;
         common_prompt_checkpoint draft_checkpoint;
         bool target_checkpointed = false;
@@ -335,6 +336,8 @@ extern "C" llama_rs_status llama_rs_speculative_prepare_draft(
     const llama_token * prompt_tokens,
     size_t prompt_tokens_count,
     int32_t n_max,
+    float temperature,
+    uint32_t seed,
     char ** out_error) {
     if (out_error) {
         *out_error = nullptr;
@@ -352,6 +355,7 @@ extern "C" llama_rs_status llama_rs_speculative_prepare_draft(
         }
         llama_rs_assign_tokens(sequence.prompt, prompt_tokens, prompt_tokens_count);
         sequence.draft.clear();
+        sequence.draft_distributions.clear();
         sequence.last_draft_len = 0;
         sequence.target_checkpoint.clear();
         sequence.draft_checkpoint.clear();
@@ -374,14 +378,16 @@ extern "C" llama_rs_status llama_rs_speculative_prepare_draft(
         }
 
         auto & params = common_speculative_get_draft_params(spec->spec, seq_id);
-        params = {
-            true,
-            n_max,
-            draft_n_past,
-            id_last,
-            &sequence.prompt,
-            &sequence.draft,
-        };
+        params = {};
+        params.drafting = true;
+        params.n_max = n_max;
+        params.n_past = draft_n_past;
+        params.id_last = id_last;
+        params.prompt = &sequence.prompt;
+        params.result = &sequence.draft;
+        params.dists = &sequence.draft_distributions;
+        params.temperature = temperature;
+        params.seed = seed;
         sequence.prepared = true;
         return LLAMA_RS_STATUS_OK;
     } catch (...) {
@@ -485,6 +491,99 @@ extern "C" llama_rs_status llama_rs_speculative_get_draft(
         }
         if (!sequence.draft.empty()) {
             std::memcpy(out_tokens, sequence.draft.data(), sequence.draft.size() * sizeof(llama_token));
+        }
+        return LLAMA_RS_STATUS_OK;
+    } catch (...) {
+        return llama_rs_chat_current_exception(out_error);
+    }
+}
+
+extern "C" llama_rs_status llama_rs_speculative_get_draft_distribution_sizes(
+    struct llama_rs_speculative * spec,
+    llama_seq_id seq_id,
+    size_t * out_distribution_count,
+    size_t * out_candidate_count,
+    char ** out_error) {
+    if (out_error) {
+        *out_error = nullptr;
+    }
+    if (!spec || !spec->spec || !out_distribution_count || !out_candidate_count || seq_id < 0 ||
+        static_cast<size_t>(seq_id) >= spec->sequences.size()) {
+        return llama_rs_chat_set_error(out_error, LLAMA_RS_STATUS_INVALID_ARGUMENT, "invalid speculative distribution-size arguments");
+    }
+    try {
+        const auto & sequence = spec->sequences[seq_id];
+        if (!sequence.draft_distributions.empty() &&
+            sequence.draft_distributions.size() < sequence.draft.size()) {
+            return llama_rs_chat_set_error(out_error, LLAMA_RS_STATUS_INVALID_STATE, "speculative draft distributions do not cover the draft");
+        }
+        // common_speculative_draft() may truncate result to the caller's n_max
+        // after an implementation has produced its proposal distributions. The
+        // surviving draft is always the prefix, so expose the matching prefix of
+        // distributions rather than rejecting upstream's untrimmed tail.
+        *out_distribution_count = sequence.draft_distributions.empty()
+            ? 0
+            : sequence.draft.size();
+        *out_candidate_count = 0;
+        for (size_t i = 0; i < *out_distribution_count; ++i) {
+            const auto & distribution = sequence.draft_distributions[i];
+            if (distribution.ids.size() != distribution.probs.size()) {
+                return llama_rs_chat_set_error(out_error, LLAMA_RS_STATUS_INVALID_STATE, "speculative distribution ids and probabilities do not match");
+            }
+            *out_candidate_count += distribution.ids.size();
+        }
+        return LLAMA_RS_STATUS_OK;
+    } catch (...) {
+        return llama_rs_chat_current_exception(out_error);
+    }
+}
+
+extern "C" llama_rs_status llama_rs_speculative_get_draft_distributions(
+    struct llama_rs_speculative * spec,
+    llama_seq_id seq_id,
+    size_t * out_offsets,
+    size_t out_offsets_capacity,
+    llama_token * out_ids,
+    float * out_probabilities,
+    size_t out_candidates_capacity,
+    char ** out_error) {
+    if (out_error) {
+        *out_error = nullptr;
+    }
+    if (!spec || !spec->spec || seq_id < 0 ||
+        static_cast<size_t>(seq_id) >= spec->sequences.size()) {
+        return llama_rs_chat_set_error(out_error, LLAMA_RS_STATUS_INVALID_ARGUMENT, "invalid speculative distribution arguments");
+    }
+    try {
+        const auto & sequence = spec->sequences[seq_id];
+        const auto & distributions = sequence.draft_distributions;
+        const size_t distribution_count = distributions.empty() ? 0 : sequence.draft.size();
+        if (distributions.size() < distribution_count) {
+            return llama_rs_chat_set_error(out_error, LLAMA_RS_STATUS_INVALID_STATE, "speculative draft distributions do not cover the draft");
+        }
+        size_t candidate_count = 0;
+        for (size_t i = 0; i < distribution_count; ++i) {
+            const auto & distribution = distributions[i];
+            if (distribution.ids.size() != distribution.probs.size()) {
+                return llama_rs_chat_set_error(out_error, LLAMA_RS_STATUS_INVALID_STATE, "speculative distribution ids and probabilities do not match");
+            }
+            candidate_count += distribution.ids.size();
+        }
+        if (out_offsets_capacity < distribution_count + 1 || !out_offsets ||
+            out_candidates_capacity < candidate_count ||
+            (candidate_count > 0 && (!out_ids || !out_probabilities))) {
+            return llama_rs_chat_set_error(out_error, LLAMA_RS_STATUS_ALLOCATION_FAILED, "speculative distributions exceed the output capacity");
+        }
+        size_t offset = 0;
+        out_offsets[0] = 0;
+        for (size_t i = 0; i < distribution_count; ++i) {
+            const auto & distribution = distributions[i];
+            if (!distribution.ids.empty()) {
+                std::copy(distribution.ids.begin(), distribution.ids.end(), out_ids + offset);
+                std::copy(distribution.probs.begin(), distribution.probs.end(), out_probabilities + offset);
+            }
+            offset += distribution.ids.size();
+            out_offsets[i + 1] = offset;
         }
         return LLAMA_RS_STATUS_OK;
     } catch (...) {

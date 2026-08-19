@@ -1070,6 +1070,14 @@ fn main() {
             mtmd_build.file("wrapper_mtmd_speculative.cpp");
         }
 
+        // mtmd uses the vendored hashing helpers directly. Upstream normally
+        // supplies these through vendor::hash, but this direct build bypasses
+        // the tools CMake targets, so compile that target's sources here too.
+        let hash_src = llama_src.join("vendor/hash");
+        mtmd_build
+            .include(&hash_src)
+            .file(hash_src.join("hash.cpp"));
+
         if matches!(target_os, TargetOs::Windows(WindowsVariant::Msvc)) {
             mtmd_build.flag("/std:c++17");
         }
@@ -1096,6 +1104,12 @@ fn main() {
         }
 
         mtmd_build.compile("mtmd");
+
+        cc::Build::new()
+            .include(&hash_src)
+            .file(hash_src.join("sha256/sha256.c"))
+            .pic(true)
+            .compile("mtmd-hash");
     }
 
     // Search paths

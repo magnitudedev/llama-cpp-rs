@@ -14,6 +14,7 @@ use llama_cpp_sys_2 as sys;
 
 use crate::context::LlamaContext;
 use crate::model::LlamaModel;
+use crate::speculative::SpeculativeDraft;
 use crate::token::LlamaToken;
 
 const NULL_TOKEN: sys::llama_token = -1;
@@ -473,6 +474,75 @@ impl<'model> CommonSampler<'model> {
                 indices.len(),
                 raw_draft.as_ptr(),
                 raw_draft.len(),
+                grammar_first,
+                output.as_mut_ptr(),
+                output.len(),
+                &raw mut output_len,
+                &raw mut error,
+            )
+        };
+        check_status(status, error)?;
+        output.truncate(output_len);
+        Ok(output.into_iter().map(LlamaToken).collect())
+    }
+
+    /// Verify a speculative proposal, using sparse proposal distributions when supplied.
+    pub fn sample_and_accept_draft(
+        &mut self,
+        context: &LlamaContext<'model>,
+        indices: &[i32],
+        draft: &SpeculativeDraft,
+        grammar_first: bool,
+    ) -> Result<Vec<LlamaToken>, CommonSamplerError> {
+        if draft.distributions().is_empty() {
+            return self.sample_and_accept_n(context, indices, draft.tokens(), grammar_first);
+        }
+        if !std::ptr::eq(self.model, context.model) {
+            return Err(CommonSamplerError::MismatchedModel);
+        }
+        if indices.len() != draft.len() + 1 || draft.distributions().len() != draft.len() {
+            return Err(CommonSamplerError::LogitsUnavailable { index: -1 });
+        }
+        for &index in indices {
+            if !context.has_initialized_logits(index) {
+                return Err(CommonSamplerError::LogitsUnavailable { index });
+            }
+        }
+
+        let raw_draft = draft
+            .tokens()
+            .iter()
+            .map(|token| token.0)
+            .collect::<Vec<_>>();
+        let mut offsets = Vec::with_capacity(draft.len() + 1);
+        let mut ids = Vec::new();
+        let mut probabilities = Vec::new();
+        offsets.push(0);
+        for distribution in draft.distributions() {
+            if distribution.ids().len() != distribution.probabilities().len() {
+                return Err(CommonSamplerError::LogitsUnavailable { index: -1 });
+            }
+            ids.extend(distribution.ids().iter().map(|token| token.0));
+            probabilities.extend_from_slice(distribution.probabilities());
+            offsets.push(ids.len());
+        }
+
+        let mut output = vec![NULL_TOKEN; indices.len()];
+        let mut output_len = 0_usize;
+        let mut error = ptr::null_mut();
+        let status = unsafe {
+            sys::llama_rs_common_sampler_sample_and_accept_draft(
+                self.raw.as_ptr(),
+                context.context.as_ptr(),
+                indices.as_ptr(),
+                indices.len(),
+                raw_draft.as_ptr(),
+                raw_draft.len(),
+                offsets.as_ptr(),
+                offsets.len(),
+                ids.as_ptr(),
+                probabilities.as_ptr(),
+                ids.len(),
                 grammar_first,
                 output.as_mut_ptr(),
                 output.len(),

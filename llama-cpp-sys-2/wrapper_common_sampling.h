@@ -196,6 +196,24 @@ llama_rs_status llama_rs_common_sampler_sample_and_accept_n(
     size_t * out_tokens_count,
     char ** out_error);
 
+llama_rs_status llama_rs_common_sampler_sample_and_accept_draft(
+    struct llama_rs_common_sampler * sampler,
+    struct llama_context * context,
+    const int32_t * indices,
+    size_t indices_count,
+    const llama_token * draft,
+    size_t draft_count,
+    const size_t * distribution_offsets,
+    size_t distribution_offsets_count,
+    const llama_token * distribution_ids,
+    const float * distribution_probabilities,
+    size_t distribution_candidate_count,
+    bool grammar_first,
+    llama_token * out_tokens,
+    size_t out_tokens_capacity,
+    size_t * out_tokens_count,
+    char ** out_error);
+
 llama_rs_status llama_rs_common_sampler_reset(
     struct llama_rs_common_sampler * sampler,
     char ** out_error);
