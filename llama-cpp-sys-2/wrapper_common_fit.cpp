@@ -1115,6 +1115,7 @@ static llama_rs_status llama_rs_fit_report_create_impl(
             tensor_buft_overrides,
             margins,
             n_ctx_min,
+            nullptr,
             log_level);
         const auto fitted = llama_rs_fit_measure(path_model, mparams, cparams, log_level);
 
@@ -1516,6 +1517,7 @@ extern "C" int llama_rs_fit_params(
             tensor_buft_overrides,
             margins,
             n_ctx_min,
+            nullptr,
             log_level));
     } catch (...) {
         return static_cast<int>(COMMON_PARAMS_FIT_STATUS_ERROR);

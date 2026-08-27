@@ -1244,6 +1244,15 @@ fn main() {
 
     assert_ne!(llama_libs.len(), 0);
 
+    if cfg!(feature = "mtmd") {
+        let vendor_hash_dir = out_dir.join("build").join("vendor").join("hash");
+        println!(
+            "cargo:rustc-link-search=native={}",
+            vendor_hash_dir.display()
+        );
+        println!("cargo:rustc-link-lib=static=vendor-hash");
+    }
+
     let common_lib_dir = out_dir.join("build").join("common");
     if cfg!(feature = "common") && common_lib_dir.is_dir() {
         println!(

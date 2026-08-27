@@ -190,7 +190,8 @@ extern "C" llama_rs_status llama_rs_mtmd_bitmap_init_from_file(
     }
 
     try {
-        const auto wrapped = mtmd_helper_bitmap_init_from_file(context, path, placeholder);
+        const auto wrapped = mtmd_helper_bitmap_init_from_file(
+            context, path, placeholder, mtmd_helper_init_opt_default());
         if (wrapped.video_ctx) {
             mtmd_bitmap_free(wrapped.bitmap);
             mtmd_helper_video_free(wrapped.video_ctx);
@@ -228,7 +229,7 @@ extern "C" llama_rs_status llama_rs_mtmd_bitmap_init_from_buffer(
 
     try {
         const auto wrapped = mtmd_helper_bitmap_init_from_buf(
-            context, data, data_len, placeholder);
+            context, data, data_len, placeholder, mtmd_helper_init_opt_default());
         if (wrapped.video_ctx) {
             mtmd_bitmap_free(wrapped.bitmap);
             mtmd_helper_video_free(wrapped.video_ctx);

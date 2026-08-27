@@ -504,7 +504,9 @@ impl LlamaModelParams {
     pub fn use_mmap(&self) -> bool {
         matches!(
             self.params.load_mode,
-            llama_cpp_sys_2::LLAMA_LOAD_MODE_MMAP | llama_cpp_sys_2::LLAMA_LOAD_MODE_MMAP_MLOCK
+            llama_cpp_sys_2::LLAMA_LOAD_MODE_AUTO
+                | llama_cpp_sys_2::LLAMA_LOAD_MODE_MMAP
+                | llama_cpp_sys_2::LLAMA_LOAD_MODE_MMAP_MLOCK
         )
     }
 
