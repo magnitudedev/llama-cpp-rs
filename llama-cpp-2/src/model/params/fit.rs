@@ -7,6 +7,7 @@ use std::ptr::{self, NonNull};
 
 use crate::context::params::LlamaContextParams;
 use crate::model::params::LlamaModelParams;
+use crate::model::LlamaModel;
 
 use llama_cpp_sys_2 as sys;
 
@@ -665,6 +666,31 @@ impl Drop for NativeFitCalibration {
     }
 }
 
+fn decode_measurement_reports(
+    status: sys::llama_rs_status,
+    native_error: *mut c_char,
+    raw_reports: Vec<*mut sys::llama_rs_fit_report>,
+) -> Result<Vec<FitReport>, FitReportError> {
+    if status != sys::LLAMA_RS_STATUS_OK {
+        return Err(FitReportError::Native {
+            status,
+            message: take_native_error(native_error),
+        });
+    }
+    if !native_error.is_null() {
+        unsafe { sys::llama_rs_string_free(native_error) };
+    }
+    raw_reports
+        .into_iter()
+        .map(|report| {
+            let report = NativeFitReport(
+                NonNull::new(report).ok_or(FitReportError::Malformed("null batch report"))?,
+            );
+            decode_report(&report)
+        })
+        .collect()
+}
+
 impl FitCalibration {
     /// Run bounded model-free calibration against the initialized native backend registry.
     ///
@@ -788,6 +814,77 @@ impl FitCalibration {
 }
 
 impl LlamaModelParams {
+    /// Measure several execution contexts from an already constructed model.
+    ///
+    /// `self` must contain the same model-loading parameters used to construct `model`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FitReportError`] for invalid buffers, native inspection failures, or malformed
+    /// bridge results.
+    pub fn measure_loaded_contexts(
+        &self,
+        model: &LlamaModel,
+        contexts: &[LlamaContextParams],
+        margins: &[usize],
+    ) -> Result<Vec<FitReport>, FitReportError> {
+        self.measure_loaded_contexts_impl(model, contexts, margins, false)
+    }
+
+    /// Measure several execution contexts with decode-workload facts from an already constructed
+    /// model.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FitReportError`] for invalid buffers, native inspection failures, or malformed
+    /// bridge results.
+    pub fn measure_loaded_contexts_with_decode_workload(
+        &self,
+        model: &LlamaModel,
+        contexts: &[LlamaContextParams],
+        margins: &[usize],
+    ) -> Result<Vec<FitReport>, FitReportError> {
+        self.measure_loaded_contexts_impl(model, contexts, margins, true)
+    }
+
+    fn measure_loaded_contexts_impl(
+        &self,
+        model: &LlamaModel,
+        contexts: &[LlamaContextParams],
+        margins: &[usize],
+        capture_decode_workload: bool,
+    ) -> Result<Vec<FitReport>, FitReportError> {
+        let _logger_guard = crate::log::lock_native_logger();
+        let max_devices = unsafe { sys::llama_max_devices() };
+        if margins.len() < max_devices {
+            return Err(FitReportError::InvalidMargins {
+                provided: margins.len(),
+                required: max_devices,
+            });
+        }
+        let raw_contexts = contexts
+            .iter()
+            .map(|context| context.context_params)
+            .collect::<Vec<_>>();
+        let mut raw_reports = vec![ptr::null_mut(); contexts.len()];
+        let mut native_error: *mut c_char = ptr::null_mut();
+        let status = unsafe {
+            sys::llama_rs_fit_measure_loaded_reports_create(
+                model.model.as_ptr(),
+                &raw const self.params,
+                raw_contexts.as_ptr(),
+                raw_contexts.len(),
+                margins.as_ptr(),
+                margins.len(),
+                capture_decode_workload,
+                sys::GGML_LOG_LEVEL_ERROR,
+                raw_reports.as_mut_ptr(),
+                &raw mut native_error,
+            )
+        };
+        decode_measurement_reports(status, native_error, raw_reports)
+    }
+
     /// Measure several execution contexts while constructing the no-allocation model once.
     ///
     /// This is an exact projection of llama.cpp model/context graphs. It does not run
@@ -859,24 +956,7 @@ impl LlamaModelParams {
                 &raw mut native_error,
             )
         };
-        if status != sys::LLAMA_RS_STATUS_OK {
-            return Err(FitReportError::Native {
-                status,
-                message: take_native_error(native_error),
-            });
-        }
-        if !native_error.is_null() {
-            unsafe { sys::llama_rs_string_free(native_error) };
-        }
-        raw_reports
-            .into_iter()
-            .map(|report| {
-                let report = NativeFitReport(
-                    NonNull::new(report).ok_or(FitReportError::Malformed("null batch report"))?,
-                );
-                decode_report(&report)
-            })
-            .collect()
+        decode_measurement_reports(status, native_error, raw_reports)
     }
 
     /// Fit unset model/context parameters and return structured memory diagnostics.
@@ -1849,5 +1929,45 @@ mod tests {
                 assert!(metric.relative_spread <= 0.05);
             }
         }
+    }
+
+    #[test]
+    #[ignore = "requires LLAMA_CPP_FIT_PARITY_MODEL to name a complete GGUF"]
+    fn loaded_model_measurement_matches_path_measurement() {
+        use std::num::NonZeroU32;
+        use std::path::PathBuf;
+
+        use crate::model::params::LlamaGpuLayers;
+
+        let model_path = PathBuf::from(
+            std::env::var_os("LLAMA_CPP_FIT_PARITY_MODEL")
+                .expect("LLAMA_CPP_FIT_PARITY_MODEL must name a complete GGUF"),
+        );
+        let backend = crate::llama_backend::LlamaBackend::init()
+            .expect("initialize native backend for loaded-model parity");
+        let params = LlamaModelParams::default()
+            .with_gpu_layers(LlamaGpuLayers::Count(0))
+            .with_no_alloc(true);
+        let model = LlamaModel::load_from_file(&backend, &model_path, &params)
+            .expect("open no-allocation parity model");
+        let model_path = std::ffi::CString::new(model_path.to_string_lossy().as_bytes())
+            .expect("parity model path has no interior NUL");
+        let contexts = [
+            LlamaContextParams::default().with_n_ctx(NonZeroU32::new(128)),
+            LlamaContextParams::default().with_n_ctx(NonZeroU32::new(256)),
+        ];
+        let margins = vec![0; crate::max_devices()];
+
+        let mut loaded = params
+            .measure_loaded_contexts(&model, &contexts, &margins)
+            .expect("measure already-open model");
+        let mut path = params
+            .measure_contexts(&model_path, &contexts, &margins)
+            .expect("measure path-opened model");
+        for report in loaded.iter_mut().chain(&mut path) {
+            report.elapsed_microseconds = 0;
+        }
+
+        assert_eq!(loaded, path);
     }
 }

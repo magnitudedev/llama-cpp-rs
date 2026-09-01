@@ -186,6 +186,20 @@ llama_rs_status llama_rs_fit_measure_reports_create(
     struct llama_rs_fit_report ** out_reports,
     char ** out_error);
 
+// Measures several contexts against an already constructed no-allocation model.
+// The caller retains ownership of model for the complete call.
+llama_rs_status llama_rs_fit_measure_loaded_reports_create(
+    const struct llama_model * model,
+    const struct llama_model_params * mparams,
+    const struct llama_context_params * cparams,
+    size_t profile_count,
+    const size_t * margins,
+    size_t margins_count,
+    bool capture_decode_workload,
+    enum ggml_log_level log_level,
+    struct llama_rs_fit_report ** out_reports,
+    char ** out_error);
+
 typedef struct llama_rs_fit_device {
     size_t index;
     enum llama_rs_fit_device_kind kind;

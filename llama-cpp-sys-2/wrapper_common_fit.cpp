@@ -1189,42 +1189,32 @@ static llama_rs_status llama_rs_fit_report_create_impl(
     }
 }
 
-extern "C" llama_rs_status llama_rs_fit_measure_reports_create(
-    const char * path_model,
+static llama_rs_status llama_rs_fit_measure_loaded_reports_create_impl(
+    const struct llama_model * model,
     const struct llama_model_params * mparams,
     const struct llama_context_params * cparams,
     size_t profile_count,
     const size_t * margins,
     size_t margins_count,
     bool capture_decode_workload,
-    enum ggml_log_level,
     struct llama_rs_fit_report ** out_reports,
     char ** out_error) {
     if (out_error) {
         *out_error = nullptr;
     }
-    if (!path_model || !mparams || (!cparams && profile_count != 0) ||
+    if (!model || !mparams || (!cparams && profile_count != 0) ||
         !margins || !out_reports || margins_count < llama_max_devices()) {
         return llama_rs_chat_set_error(out_error, LLAMA_RS_STATUS_INVALID_ARGUMENT,
             "batch fit measurement arguments are invalid");
     }
     std::fill(out_reports, out_reports + profile_count, nullptr);
     try {
-        llama_model_params loading = *mparams;
-        loading.no_alloc = true;
-        loading.load_mode = LLAMA_LOAD_MODE_NONE;
-        std::unique_ptr<llama_model, decltype(&llama_model_free)> model(
-            llama_model_load_from_file(path_model, loading), llama_model_free);
-        if (!model) {
-            throw std::runtime_error("failed to load model");
-        }
-
         std::vector<std::unique_ptr<llama_rs_fit_report>> reports;
         reports.reserve(profile_count);
         for (size_t profile = 0; profile < profile_count; ++profile) {
             const int64_t started_at = llama_time_us();
             const auto measurement = llama_rs_fit_measure_loaded(
-                model.get(),
+                model,
                 &cparams[profile],
                 capture_decode_workload);
             auto report = std::make_unique<llama_rs_fit_report>();
@@ -1259,6 +1249,57 @@ extern "C" llama_rs_status llama_rs_fit_measure_reports_create(
             out_reports[profile] = reports[profile].release();
         }
         return LLAMA_RS_STATUS_OK;
+    } catch (...) {
+        return llama_rs_chat_current_exception(out_error);
+    }
+}
+
+extern "C" llama_rs_status llama_rs_fit_measure_loaded_reports_create(
+    const struct llama_model * model,
+    const struct llama_model_params * mparams,
+    const struct llama_context_params * cparams,
+    size_t profile_count,
+    const size_t * margins,
+    size_t margins_count,
+    bool capture_decode_workload,
+    enum ggml_log_level,
+    struct llama_rs_fit_report ** out_reports,
+    char ** out_error) {
+    return llama_rs_fit_measure_loaded_reports_create_impl(
+        model, mparams, cparams, profile_count, margins, margins_count,
+        capture_decode_workload, out_reports, out_error);
+}
+
+extern "C" llama_rs_status llama_rs_fit_measure_reports_create(
+    const char * path_model,
+    const struct llama_model_params * mparams,
+    const struct llama_context_params * cparams,
+    size_t profile_count,
+    const size_t * margins,
+    size_t margins_count,
+    bool capture_decode_workload,
+    enum ggml_log_level,
+    struct llama_rs_fit_report ** out_reports,
+    char ** out_error) {
+    if (out_error) {
+        *out_error = nullptr;
+    }
+    if (!path_model || !mparams) {
+        return llama_rs_chat_set_error(out_error, LLAMA_RS_STATUS_INVALID_ARGUMENT,
+            "batch fit model arguments are invalid");
+    }
+    try {
+        llama_model_params loading = *mparams;
+        loading.no_alloc = true;
+        loading.load_mode = LLAMA_LOAD_MODE_NONE;
+        std::unique_ptr<llama_model, decltype(&llama_model_free)> model(
+            llama_model_load_from_file(path_model, loading), llama_model_free);
+        if (!model) {
+            throw std::runtime_error("failed to load model");
+        }
+        return llama_rs_fit_measure_loaded_reports_create_impl(
+            model.get(), mparams, cparams, profile_count, margins, margins_count,
+            capture_decode_workload, out_reports, out_error);
     } catch (...) {
         return llama_rs_chat_current_exception(out_error);
     }
